@@ -1,0 +1,9 @@
+{
+	"cardinalities":
+		[
+			{"TYPE": "ACCOUNT",        "LINKED_TO": "INDIVIDUAL", "MAX": 4},
+			{"TYPE": "ADDRESS",        "LINKED_TO": "INDIVIDUAL", "MAX": 2},
+			{"TYPE": "CREDIT_DEVICE",  "LINKED_TO": "INDIVIDUAL", "MAX": 4},
+			{"TYPE": "DISPLAY_DEVICE", "LINKED_TO": "INDIVIDUAL", "MAX": 6}
+		]
+}

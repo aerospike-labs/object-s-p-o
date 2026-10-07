@@ -1,0 +1,95 @@
+{
+	"config": {
+		"aerospike": {
+			"nodes": 4,
+			"instanceType": "i7i.12xlarge",
+			"asVersion": "8.2.0.0",
+			"configType": "hybrid",
+			"distro": "ubuntu",
+			"distroVersion": "24.04",
+			"sprigs": 32768,
+			"flashConfig": {
+				"flashPartitions": 2,
+				"whichNVMeForFlash": 1,
+				"partPercent": 25,
+				"mountsBudget": "100G"
+			},
+			"nvme": {
+				"nvme": 3,
+				"partitions": 2,
+				"useNvme": "1"
+			},
+			"rackAware": {
+				"useRA": "false",
+				"racks": {
+					"id": [
+						{"rackID": 1, "nodeID": "a"},
+	  				{"rackID": 2, "nodeID": "b"},
+	  				{"rackID": 3, "nodeID": "c"}
+					]
+				}
+			},
+			"nameSpace": "test",
+			"RAM": 240,
+			"protofdmax": 90000,
+			"clusterName": "ac",
+			"startEngine": "no-start",
+			"serviceThreads": 160,
+			"ttl": "1D",
+			"setAlternateAccess": "true"
+		},
+		"clients": {
+			"nodes": 4,
+			"instanceType": "r6i.8xlarge",
+			"asVersion": "8.2.0.0",
+			"clientName": "ac-client",
+			"distro": "ubuntu",
+			"distroVersion": "24.04",
+			"queryConfig": {
+			  "useNodes": false,
+				"queryNodes": "4,5,6,7,8",
+				"batchNodes": "",
+				"updateNodes": "",
+				"loadNodes": "1,2,3",
+				"loadNodesOdd": "1,3",
+				"loadNodesEven": "2",
+				"duration": 600
+			},
+			"asbenchConfig": {
+				"rows": "1,000,000,000",
+				"userInstalled": "false",
+				"insertThreads": 120,
+				"ruThreads": 120,
+				"duration": 36000,
+				"rowConfig": "I2,I4,S500,S500,B500",
+				"userPass": "krypton",
+				"userName": "superman",
+				"userRole": "supuser"
+			}
+		},
+		"cloud": {
+			"cloudProvider": "aws",
+			"region": "us-east-2",
+			"useAZs": "false",
+			"multiAZ": {
+				"AZs":		[
+					{"nodesAZ": 3, "zone": "us-east-2a", "subnet": "subnet-0a446420a00ff0050", "securityGroup": "sg-041e0235360cdac52", "rackID": 1, "nodeID": "a"},
+					{"nodesAZ": 3, "zone": "us-east-2b", "subnet": "subnet-04ed6bb1f5085b30c", "securityGroup": "sg-041e0235360cdac52", "rackID": 2, "nodeID": "b"},
+					{"nodesAZ": 3, "zone": "us-east-2c", "subnet": "subnet-04ed6bb1f5085b30c", "securityGroup": "sg-041e0235360cdac52", "rackID": 3, "nodeID": "c"}
+				]
+			}
+		},
+		"ams": {
+			"nodes": 1,
+			"instanceType": "i4i.xlarge",
+			"asVersion": "8.2.0.0",
+			"amsName": "ac-Mgmt"
+		},
+		"tools": {
+			"go": "false",
+			"python": "false"
+		},
+		"uploadFiles": [{"1": "query/ac.go","2": "load/load.go"}]
+	}
+}
+

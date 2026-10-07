@@ -1,0 +1,57 @@
+{
+	"contentTypes":
+		{
+			"INDIVIDUAL":
+				{
+					"IDL": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"CAM_GID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"CCID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.428571429}],
+					"CCsID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}],
+					"CELL_PHONE_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"CMF_PHONE_D": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"CYOTA_ID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"EMAIL_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"MST_ID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"PHONE_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"TELESOURCE_PHONE_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}]
+				},
+			"ACCOUNT":
+				{
+					"BASE_CIN_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"CCsID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}],
+					"CL_TID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"CYOTA_IE_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}]
+				},
+			"DISPLAY_DEVICE":
+				{
+					"AAID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"CUUID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}],
+					"IDFA_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"MCID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}],
+					"RF_USER_ID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}],
+					"SAPIENT_PROSPECT_ID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}],
+					"SITECAT_ID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}],
+					"TNT_PCID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.016666667}]
+				},
+			"ADDRESS": 
+				{
+					"ABT_ALINK_E":[{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}]
+				},
+			"CREDIT_DEVICE":
+				{
+					"ACCTNUM_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"DL_TID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"REG_CIN_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}]
+				},
+			"HOUSEHOLD": 
+				{
+					"CMF_PHONE_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"EMAIL_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"HHID_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"HHT2_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"LR_PARTNER_HH_ID": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"PHONE_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}],
+					"TELESOURCE_PHONE_E": [{"CREATED": 0, "LAST_SEEN": 0, "DECAY": 0.1}]
+				}
+		}
+}
