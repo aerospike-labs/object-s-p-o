@@ -16,3 +16,6 @@ __pycache__/
 # Archives / packages
 *.tgz
 *.tar
+
+# macOS
+.DS_Store
