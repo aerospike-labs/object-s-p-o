@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	aero "github.com/aerospike/aerospike-client-go/v8"
+	"github.com/aerospike/aerospike-client-go/v8/types"
 )
 
 // MetaSetName holds generator bookkeeping, kept apart from the triples set.
@@ -96,4 +97,41 @@ func (gs *GraphStore) RaiseCounter(name string, min int64) error {
 	}
 	_, err = gs.ReserveCounter(name, min-cur)
 	return err
+}
+
+// GetMetaString returns a string bin of the named meta record, or "" if the
+// record doesn't exist.
+func (gs *GraphStore) GetMetaString(name, bin string) (string, error) {
+	key, err := gs.counterKey(name)
+	if err != nil {
+		return "", err
+	}
+	rec, err := gs.Client.Get(nil, key, bin)
+	if err != nil {
+		if err.Matches(aero.ErrKeyNotFound.ResultCode) {
+			return "", nil
+		}
+		return "", err
+	}
+	v, _ := rec.Bins[bin].(string)
+	return v, nil
+}
+
+// CreateMetaString writes a string bin to the named meta record only if the
+// record doesn't exist yet, and reports whether this call created it. Safe
+// across hosts: when several race, exactly one creates it.
+func (gs *GraphStore) CreateMetaString(name, bin, value string) (bool, error) {
+	key, err := gs.counterKey(name)
+	if err != nil {
+		return false, err
+	}
+	wp := *gs.WritePolicy
+	wp.RecordExistsAction = aero.CREATE_ONLY
+	if err := gs.Client.PutBins(&wp, key, aero.NewBin(bin, value)); err != nil {
+		if err.Matches(types.KEY_EXISTS_ERROR) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }

@@ -47,6 +47,10 @@ MAX_INFO_EDGES = 50
 HUB_COUNT_CAP = 1000
 # Concurrent queries per BFS level; hides round-trip latency to remote clusters.
 QUERY_THREADS = 16
+# Hashed entity IDs whose type is remembered; cleared when exceeded.
+TYPE_CACHE_MAX = 200000
+# Keys per batch read when looking up the types of hashed entity IDs.
+TYPE_LOOKUP_BATCH = 5000
 # Triples sampled for node search and the predicate list, instead of scanning
 # the whole set. Any full node ID can still be found by typing it exactly.
 DEFAULT_SAMPLE_SIZE = 100000
@@ -57,19 +61,94 @@ HASH_DISPLAY_CHARS = 20
 HASH_RE = re.compile(r"[0-9a-f]{64}|[0-9a-f]{128}")
 
 
-DEFAULT_ONTOLOGY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "descriptors", "ontology.json")
+DESCRIPTORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "descriptors")
+DEFAULT_ONTOLOGY = os.path.join(DESCRIPTORS, "ontology.json")
+DEFAULT_CONTENT_TYPES = os.path.join(DESCRIPTORS, "contentTypes.json")
+
+# The generator records how it hashed the navigation parts (entity IDs,
+# predicates, type names) in this meta record, e.g. "readable" or
+# "sha-512:entity-ids,predicates,types".
+META_SET = "meta"
+HASH_CONFIG_KEY = "hash_config"
+HASH_FUNCS = {
+    "sha-256": lambda s: hashlib.sha256(s.encode()).hexdigest(),
+    "sha-512": lambda s: hashlib.sha512(s.encode()).hexdigest(),
+}
 
 
 def load_ontology(path):
-    """Relationship predicates and entity types from the ontology descriptor.
-
-    These are never hashed, so navigating by them works with any hash type.
-    """
+    """Relationship predicates and entity types from the ontology descriptor."""
     with open(path) as f:
         rules = json.load(f)["ontology"]
     predicates = sorted({r["PRED"] for r in rules})
     types = sorted({r["SUB"] for r in rules} | {r["OBJ"] for r in rules})
     return predicates, types
+
+
+def load_content_types(path):
+    """Entity type names and identifier type names from the content types
+    descriptor, used to label hashed type names. Missing file: none."""
+    try:
+        with open(path) as f:
+            content_types = json.load(f)["contentTypes"]
+    except FileNotFoundError:
+        return [], []
+    identifier_types = {p for props in content_types.values() for p in props}
+    return sorted(content_types), sorted(identifier_types)
+
+
+def read_navigation(client, namespace):
+    """The generator's navigation signature, or "readable" when none is
+    recorded (data loaded before it was, when navigation was never hashed)."""
+    try:
+        _, _, bins = client.get((namespace, META_SET, HASH_CONFIG_KEY))
+    except aerospike.exception.RecordNotFound:
+        return "readable"
+    return bins.get("navigation") or "readable"
+
+
+class Navigation:
+    """How entity IDs, predicates and type names are stored.
+
+    Maps readable predicate and type names to their stored (possibly hashed)
+    values for queries, and stored values back to readable labels for display.
+    The vocabulary of predicates and types is small and known from the
+    descriptors, so hashed ones can always be labelled.
+    """
+
+    def __init__(self, signature, predicates, types):
+        self.signature = signature
+        hash_type, _, parts = signature.partition(":")
+        parts = set(parts.split(",")) if parts else set()
+        if parts and hash_type not in HASH_FUNCS:
+            raise SystemExit(f"Unknown hash type in recorded navigation signature {signature!r}")
+        h = HASH_FUNCS.get(hash_type)
+        self.entity_ids_hashed = "entity-ids" in parts
+        self._pred = h if "predicates" in parts else (lambda s: s)
+        self._type = h if "types" in parts else (lambda s: s)
+        self.labels = {self._pred(p): p for p in predicates}
+        self.labels.update({self._type(t): t for t in types})
+
+    def pred(self, name):
+        """Stored value of a readable predicate."""
+        return self._pred(name)
+
+    def type(self, name):
+        """Stored value of a readable type name."""
+        return self._type(name)
+
+    def label(self, value):
+        """Readable label for a stored predicate or type name; anything else
+        (entity IDs, identifier data) shortened if hashed."""
+        if isinstance(value, str) and value in self.labels:
+            return self.labels[value]
+        return short(value)
+
+    def describe(self):
+        if self.signature == "readable":
+            return "Navigation: readable"
+        hash_type, _, parts = self.signature.partition(":")
+        return f"Navigation: hashed with {hash_type} ({parts})"
 
 
 def short(value):
@@ -79,9 +158,10 @@ def short(value):
     return value
 
 
-def short_props(props):
-    """Props with hashed string values shortened, as JSON for display."""
-    return json.dumps({k: short(v) for k, v in props.items()}, default=str, ensure_ascii=False)
+def short_props(props, label=None):
+    """Props with hashed string values shortened (or labelled), as JSON for display."""
+    label = label or short
+    return json.dumps({k: label(v) for k, v in props.items()}, default=str, ensure_ascii=False)
 
 
 def parse_hosts(hosts, default_port, tls_name=None):
@@ -149,18 +229,21 @@ def query_by_bin(client, namespace, bin_name, value, predicates=None, limit=None
     return [bins for _, _, bins in query.results(policy=policy)]
 
 
-def sample_graph(client, namespace, sample_size):
-    """Scan up to sample_size triples for node IDs and predicates."""
+def sample_graph(client, namespace, sample_size, is_type_pred="IS_TYPE"):
+    """Scan up to sample_size triples for node IDs, predicates, and the
+    stored type of each node whose IS_TYPE triple was sampled."""
     scan = client.scan(namespace, SETNAME)
     scan.select("subject", "predicate", "object")
-    nodes, predicates = set(), set()
+    nodes, predicates, types = set(), set(), {}
     for _, _, bins in scan.results(policy={"max_records": sample_size}):
         nodes.add(bins.get("subject", ""))
         nodes.add(bins.get("object", ""))
         predicates.add(bins.get("predicate", ""))
+        if bins.get("predicate") == is_type_pred:
+            types[bins.get("subject", "")] = bins.get("object", "")
     nodes.discard("")
     predicates.discard("")
-    return sorted(nodes), sorted(predicates)
+    return sorted(nodes), sorted(predicates), types
 
 
 def node_exists(client, namespace, node):
@@ -245,12 +328,13 @@ NODE_COLORS = {
 
 
 def node_type(node_id):
+    """Type from a readable entity ID's prefix ("ACCOUNT:12" -> "ACCOUNT")."""
     if ":" in node_id:
         return node_id.split(":")[0]
     return "default"
 
 
-def build_elements(triples):
+def build_elements(triples, node_type=node_type, label=short):
     """Convert triples to Cytoscape elements (nodes + edges)."""
     nodes = {}
     edges = []
@@ -280,7 +364,7 @@ def build_elements(triples):
                 "id": edge_id,
                 "source": s,
                 "target": o,
-                "label": short(p),
+                "label": label(p),
                 "props": props_str,
             }
         })
@@ -292,15 +376,75 @@ def build_elements(triples):
 # Dash app
 # ---------------------------------------------------------------------------
 
-def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path=DEFAULT_ONTOLOGY):
+def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path=DEFAULT_ONTOLOGY,
+               content_types_path=DEFAULT_CONTENT_TYPES):
     ontology_preds, ontology_types = load_ontology(ontology_path)
+    entity_types, identifier_types = load_content_types(content_types_path)
+    known_types = sorted(set(ontology_types) | set(entity_types))
+    nav = Navigation(read_navigation(client, namespace),
+                     ontology_preds + ["HAS_IDENTIFIER", "IS_TYPE"],
+                     known_types + identifier_types)
+    print(nav.describe())
+    # Predicates as stored, for queries; labels come from nav.label
+    stored_ontology_preds = [nav.pred(p) for p in ontology_preds]
+    has_identifier, is_type = nav.pred("HAS_IDENTIFIER"), nav.pred("IS_TYPE")
+
+    # Readable type of hashed entity IDs, which have no type prefix
+    type_cache = {}
+
+    def resolve_types(nodes):
+        """Find the type of hashed entity IDs not yet known. A node's IS_TYPE
+        triple key is computable from the node, the IS_TYPE predicate and a
+        candidate type, so one batch read checks every candidate at once."""
+        if not nav.entity_ids_hashed:
+            return
+        todo = [n for n in dict.fromkeys(nodes) if n not in type_cache]
+        if not todo:
+            return
+        if len(type_cache) + len(todo) > TYPE_CACHE_MAX:
+            type_cache.clear()
+        candidates = [(n, t) for n in todo for t in known_types]
+        for i in range(0, len(candidates), TYPE_LOOKUP_BATCH):
+            chunk = candidates[i:i + TYPE_LOOKUP_BATCH]
+            keys = [(namespace, SETNAME, triple_key(n, is_type, nav.type(t))) for n, t in chunk]
+            for (n, t), br in zip(chunk, client.batch_read(keys, ["predicate"]).batch_records):
+                if br.result == 0:
+                    type_cache[n] = t
+        for n in todo:
+            type_cache.setdefault(n, "default")
+
+    def resolve_triples(triples):
+        """Find the types of the entities in triples; identifier nodes (the
+        objects of HAS_IDENTIFIER) have no type."""
+        if not nav.entity_ids_hashed:
+            return
+        nodes = []
+        for t in triples:
+            s, p, o = t["subject"], t["predicate"], t["object"]
+            if p == is_type:
+                type_cache[s] = nav.label(o)
+            nodes.append(s)
+            if p == has_identifier:
+                type_cache.setdefault(o, "default")
+            else:
+                nodes.append(o)
+        resolve_types(nodes)
+
+    def ntype(node_id):
+        if nav.entity_ids_hashed:
+            return type_cache.get(node_id, "default")
+        return node_type(node_id)
+
+    def elements_for(triples):
+        resolve_triples(triples)
+        return build_elements(triples, ntype, nav.label)
 
     def effective_predicates(pred_filter, ontology_on):
         """Predicates to traverse: the selected ones, limited to the ontology's
         relationships (all of them if none selected) when ontology_on."""
         if ontology_on:
-            chosen = [p for p in (pred_filter or []) if p in ontology_preds]
-            return chosen or ontology_preds
+            chosen = [p for p in (pred_filter or []) if p in stored_ontology_preds]
+            return chosen or stored_ontology_preds
         return pred_filter or None
 
     app = dash.Dash(__name__)
@@ -530,10 +674,12 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
                  (Output("refresh-status", "children"), f"Sampling up to {sample_size:,} triples...", "")],
     )
     def refresh_dropdowns(n_clicks):
-        nodes, predicates = sample_graph(client, namespace, sample_size)
+        nodes, predicates, types = sample_graph(client, namespace, sample_size, is_type)
         node_cache[:] = nodes
+        if nav.entity_ids_hashed:
+            type_cache.update({n: nav.label(t) for n, t in types.items()})
         status = (f"Sampled {len(nodes):,} nodes, {len(predicates)} predicates. "
-                  "Type a full node ID to find any node.")
+                  f"Type a full node ID to find any node. {nav.describe()}.")
         return predicates, status
 
     @app.callback(
@@ -544,9 +690,9 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
     )
     def predicate_options(sampled, ontology_on):
         if ontology_on:
-            return ([{"label": p, "value": p} for p in ontology_preds],
+            return ([{"label": p, "value": nav.pred(p)} for p in ontology_preds],
                     "All ontology relationships")
-        return [{"label": short(p), "value": p} for p in sampled or []], "All predicates"
+        return [{"label": nav.label(p), "value": p} for p in sampled or []], "All predicates"
 
     @app.callback(
         Output("start-node", "options"),
@@ -560,19 +706,24 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
                 return [{"label": short(selected), "value": selected}]
             raise PreventUpdate
         # In ontology mode, offer only entities of the ontology's types
-        wanted = (lambda n: node_type(n) in ontology_types) if ontology_on else (lambda n: True)
+        wanted = (lambda n: ntype(n) in ontology_types) if ontology_on else (lambda n: True)
         needle = search.lower()
-        matches = []
+        found = []
         for n in node_cache:
-            if needle in n.lower() and wanted(n):
-                matches.append({"label": short(n), "value": n})
-                if len(matches) >= MAX_NODE_OPTIONS:
+            if needle in n.lower():
+                found.append(n)
+                if len(found) >= MAX_NODE_OPTIONS * 4:
                     break
+        if ontology_on:
+            resolve_types(found)
+        matches = [{"label": short(n), "value": n} for n in found if wanted(n)][:MAX_NODE_OPTIONS]
         # Nodes outside the sample are found by exact ID
         exact = search.strip()
-        if (all(m["value"] != exact for m in matches) and wanted(exact)
-                and node_exists(client, namespace, exact)):
-            matches.insert(0, {"label": short(exact), "value": exact})
+        if all(m["value"] != exact for m in matches) and node_exists(client, namespace, exact):
+            if ontology_on:
+                resolve_types([exact])
+            if wanted(exact):
+                matches.insert(0, {"label": short(exact), "value": exact})
         return matches
 
     @app.callback(
@@ -613,7 +764,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
                 return current_data
             preds = effective_predicates(pred_filter, ontology_on)
             triples, hubs = bfs_expand(client, namespace, start_node, max_hops, preds, direction)
-            elements = build_elements(triples)
+            elements = elements_for(triples)
             return {"elements": elements, "expanded": [start_node], "hubs": hubs}
 
         if trigger_id == "graph" and tap_data:
@@ -631,7 +782,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
             if node_id != start_node and len(new_triples) > MAX_EXPAND_DEGREE:
                 hubs[node_id] = degree_label(new_triples, truncated)
                 return {**current_data, "expanded": expanded, "hubs": hubs}
-            new_elements = build_elements(new_triples)
+            new_elements = elements_for(new_triples)
 
             existing = current_data.get("elements", [])
             existing_ids = {e["data"]["id"] for e in existing}
@@ -691,32 +842,34 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
             def count(ts, skip=0):
                 return f"{len(ts) - skip}" + ("+" if len(ts) >= HUB_COUNT_CAP else "")
 
-            lines = [f"Node: {short(node_id)}", f"Type: {node_type(node_id)}", ""]
+            resolve_triples(outbound)
+            resolve_types([node_id])
+            lines = [f"Node: {short(node_id)}", f"Type: {ntype(node_id)}", ""]
             if short(node_id) != node_id:
                 lines.insert(1, f"Full ID: {node_id}")
             # Identifiers are shown as properties of the entity, by type
-            identifiers = [t for t in outbound if t["predicate"] == "HAS_IDENTIFIER"]
-            relations = [t for t in outbound if t["predicate"] not in ("HAS_IDENTIFIER", "IS_TYPE")]
+            identifiers = [t for t in outbound if t["predicate"] == has_identifier]
+            relations = [t for t in outbound if t["predicate"] not in (has_identifier, is_type)]
             if identifiers:
                 lines.append(f"Identifiers: {len(identifiers)}")
-                for t in sorted(identifiers, key=lambda t: str((t.get("props") or {}).get("identifier_type", ""))):
+                for t in sorted(identifiers, key=lambda t: str(nav.label((t.get("props") or {}).get("identifier_type", "")))):
                     props = t.get("props") or {}
-                    lines.append(f"  {short(props.get('identifier_type', '?'))} = {short(props.get('value', t['object']))}")
+                    lines.append(f"  {nav.label(props.get('identifier_type', '?'))} = {short(props.get('value', t['object']))}")
                 lines.append("")
 
             lines.append(f"Outbound relationships: {count(relations)}")
             for t in relations[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
-                prop_str = f"  {short_props(props)}" if props else ""
-                lines.append(f"  -[{short(t['predicate'])}]-> {short(t['object'])}{prop_str}")
+                prop_str = f"  {short_props(props, nav.label)}" if props else ""
+                lines.append(f"  -[{nav.label(t['predicate'])}]-> {short(t['object'])}{prop_str}")
             if len(relations) > MAX_INFO_EDGES:
                 lines.append(f"  ... and {count(relations, MAX_INFO_EDGES)} more")
 
             lines.append(f"\nInbound relationships: {count(inbound)}")
             for t in inbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
-                prop_str = f"  {short_props(props)}" if props else ""
-                lines.append(f"  {short(t['subject'])} -[{short(t['predicate'])}]->{prop_str}")
+                prop_str = f"  {short_props(props, nav.label)}" if props else ""
+                lines.append(f"  {short(t['subject'])} -[{nav.label(t['predicate'])}]->{prop_str}")
             if len(inbound) > MAX_INFO_EDGES:
                 lines.append(f"  ... and {count(inbound, MAX_INFO_EDGES)} more")
 
@@ -729,7 +882,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
                 f"Target: {short(edge_data.get('target', ''))}",
                 "",
                 "Properties:",
-                short_props(json.loads(edge_data.get("props", "{}"))),
+                short_props(json.loads(edge_data.get("props", "{}")), nav.label),
             ]
             return "\n".join(lines)
 
@@ -795,6 +948,8 @@ def main():
     parser.add_argument("--listen-port", type=int, default=8050, help="Viewer web port (default: 8050)")
     parser.add_argument("--ontology", default=DEFAULT_ONTOLOGY,
                         help="Ontology descriptor whose relationships drive navigation (default: descriptors/ontology.json)")
+    parser.add_argument("--content-types", default=DEFAULT_CONTENT_TYPES,
+                        help="Content types descriptor, for labelling hashed type names (default: descriptors/contentTypes.json)")
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
                         help=f"Triples sampled for node search and predicates (default: {DEFAULT_SAMPLE_SIZE})")
     parser.add_argument("--debug", action="store_true", help="Enable Dash debug mode")
@@ -808,7 +963,7 @@ def main():
     )
     print(f"Connected to Aerospike at {args.hosts or f'{args.host}:{args.port}'}, namespace={args.namespace}")
 
-    app = create_app(client, namespace, args.sample_size, args.ontology)
+    app = create_app(client, namespace, args.sample_size, args.ontology, args.content_types)
     print(f"Starting viewer at http://127.0.0.1:{args.listen_port}")
     app.run(debug=args.debug, host="0.0.0.0", port=args.listen_port)
 

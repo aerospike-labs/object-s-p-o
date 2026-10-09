@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,13 +101,14 @@ func main() {
 	conn.RegisterFlags(flag.CommandLine)
 	namespace := flag.String("namespace", "test", "Aerospike namespace")
 	count := flag.Int("count", 1000, "Number of INDIVIDUALs to generate")
-	batchSize := flag.Int("batch", 256, "Batch write size")
+	batchSize := flag.Int("batch", 1024, "Batch write size")
 	workers := flag.Int("workers", 8, "Number of concurrent generator and writer goroutines")
 	contentTypesPath := flag.String("content-types", "descriptors/contentTypes.json", "Path to contentTypes.json")
 	ontologyPath := flag.String("ontology", "descriptors/ontology.json", "Path to ontology.json")
 	cardinalitiesPath := flag.String("cardinalities", "descriptors/cardinalities.json", "Path to cardinalities.json")
 	shareRate := flag.Float64("share-rate", 0.2, "Probability an individual links to an existing entity instead of a new one")
-	hashType := flag.String("hash-type", "no-hash", "Hash all content: no-hash, sha-256, or sha-512")
+	hashType := flag.String("hash-type", "no-hash", "Hash function for -hash-parts: no-hash, sha-256, or sha-512")
+	hashParts := flag.String("hash-parts", partIdentifiers, "Comma list of what -hash-type hashes: identifiers, entity-ids, predicates, types, navigation (entity-ids,predicates,types), or all")
 	clientIndex := flag.Int("client-index", 0, "This generator's index (0-based) when running on multiple hosts")
 	clientCount := flag.Int("client-count", 1, "Total number of generators running at the same time")
 	showVersion := flag.Bool("version", false, "Print the build version and exit")
@@ -119,8 +121,8 @@ func main() {
 	}
 	fmt.Println("generate", version.String())
 
-	var err error
-	if hashContent, err = newHashFunc(*hashType); err != nil {
+	navigation, hashDesc, err := configureHashing(*hashType, *hashParts)
+	if err != nil {
 		log.Fatal(err)
 	}
 	if *clientCount < 1 || *clientIndex < 0 || *clientIndex >= *clientCount {
@@ -135,7 +137,7 @@ func main() {
 	readJSON(*cardinalitiesPath, &cardFile)
 
 	fmt.Printf("Loaded %d content types, %d ontology relations, %d cardinalities (hash: %s)\n",
-		len(ctFile.ContentTypes), len(ontFile.Ontology), len(cardFile.Cardinalities), *hashType)
+		len(ctFile.ContentTypes), len(ontFile.Ontology), len(cardFile.Cardinalities), hashDesc)
 	for ct, props := range ctFile.ContentTypes {
 		fmt.Printf("  %-20s %d identifiers\n", ct, len(props))
 	}
@@ -151,16 +153,42 @@ func main() {
 	if err := gs.CreateIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
 	}
+	if err := checkHashConfig(gs, navigation); err != nil {
+		log.Fatal(err)
+	}
 
 	pool := newSharePool(*shareRate, cardFile.Cardinalities)
 
+	// Entity types are stored in the entities set as written to the triples
+	// (hashed when -hash-parts includes types); the pool works with readable names
+	var typeList []string
+	for ct := range ctFile.ContentTypes {
+		typeList = append(typeList, ct)
+	}
+	for _, c := range cardFile.Cardinalities {
+		typeList = append(typeList, c.Type)
+	}
+	readableType := typeNames(typeList, []string{"HOUSEHOLD"})
+	typeName := func(stored string) string {
+		if t, ok := readableType[stored]; ok {
+			return t
+		}
+		return stored
+	}
+	storedTypes := func(entities []store.EntityLinks) []store.EntityLinks {
+		for i := range entities {
+			entities[i].Type = hashTypeName(entities[i].Type)
+		}
+		return entities
+	}
+
 	if *rebuild {
 		fmt.Println("Rebuilding entities set from existing triples...")
-		entities, maxID, scanned, err := rebuildEntities(gs.ScanEach, pool, ontFile.Ontology)
+		entities, maxID, scanned, err := rebuildEntities(gs.ScanEach, pool, ontFile.Ontology, typeName)
 		if err != nil {
 			log.Fatalf("failed to scan triples: %v", err)
 		}
-		if err := writeInBatches(entities, *batchSize, gs.BatchPutEntityLinks); err != nil {
+		if err := writeInBatches(storedTypes(entities), *batchSize, gs.BatchPutEntityLinks); err != nil {
 			log.Fatalf("failed to write entities: %v", err)
 		}
 		if err := gs.RaiseCounter(idCounterName, maxID); err != nil {
@@ -168,6 +196,9 @@ func main() {
 		}
 		counter, _ := gs.GetCounter(idCounterName)
 		fmt.Printf("  %d triples scanned, %d entities written, ID counter at %d\n", scanned, len(entities), counter)
+		if maxID == 0 && strings.Contains(navigation, partEntityIDs) {
+			fmt.Println("  entity IDs are hashed, so the ID counter can't be recovered from them and was left as is")
+		}
 		return
 	}
 
@@ -198,7 +229,13 @@ func main() {
 		fmt.Printf("Client %d of %d: loading shareable entities from partitions %d-%d...\n",
 			*clientIndex, *clientCount, begin, begin+parts-1)
 		scanStart := time.Now()
-		loaded, err = loadShareable(gs.ScanEntities, begin, parts, pool, rand.New(rand.NewSource(rand.Int63())))
+		scan := func(begin, count int, fn func(store.EntityLinks) error) error {
+			return gs.ScanEntities(begin, count, func(e store.EntityLinks) error {
+				e.Type = typeName(e.Type)
+				return fn(e)
+			})
+		}
+		loaded, err = loadShareable(scan, begin, parts, pool, rand.New(rand.NewSource(rand.Int63())))
 		if err != nil {
 			log.Fatalf("failed to load entities: %v", err)
 		}
@@ -259,7 +296,7 @@ func main() {
 		return nil
 	}
 	flushEntities := func() {
-		if err := writeInBatches(pool.takeDirty(), *batchSize, writeEntities); err != nil {
+		if err := writeInBatches(storedTypes(pool.takeDirty()), *batchSize, writeEntities); err != nil {
 			batchErrors.Add(1)
 			log.Printf("entity write error: %v", err)
 		}
@@ -340,4 +377,54 @@ func main() {
 		fmt.Printf("  batch errors: %d\n", errors)
 		os.Exit(1)
 	}
+}
+
+// hashConfigName is the meta record holding the navigation signature of the
+// data loaded so far: how entity IDs, predicates and type names are hashed.
+const hashConfigName = "hash_config"
+
+// checkHashConfig records this run's navigation signature on the first load
+// and refuses a run whose signature differs from the data already loaded,
+// since its entities, predicates and types would not link with that data.
+// Identifier hashing is not part of the signature: runs that differ only in
+// it still link.
+func checkHashConfig(gs *store.GraphStore, navigation string) error {
+	stored, err := gs.GetMetaString(hashConfigName, "navigation")
+	if err != nil {
+		return fmt.Errorf("failed to read hash config: %w", err)
+	}
+	if stored == "" {
+		existing, err := gs.SetRecordCount(store.SetName)
+		if err != nil {
+			return fmt.Errorf("failed to check for existing triples: %w", err)
+		}
+		want := navigation
+		if existing > 0 {
+			// Loaded before the signature was recorded, when navigation
+			// parts were never hashed
+			want = readableNavigation
+		}
+		if _, err := gs.CreateMetaString(hashConfigName, "navigation", want); err != nil {
+			return fmt.Errorf("failed to record hash config: %w", err)
+		}
+		// Another generator may have recorded its signature first
+		if stored, err = gs.GetMetaString(hashConfigName, "navigation"); err != nil {
+			return fmt.Errorf("failed to read hash config: %w", err)
+		}
+	}
+	if stored != navigation {
+		return fmt.Errorf("existing data has navigation %s but this run would write %s; "+
+			"runs with different navigation hashing don't link. Use the same -hash-type and "+
+			"navigation -hash-parts as the existing data, or load into an empty namespace",
+			describeNavigation(stored), describeNavigation(navigation))
+	}
+	return nil
+}
+
+func describeNavigation(signature string) string {
+	if signature == readableNavigation {
+		return "not hashed"
+	}
+	hashType, parts, _ := strings.Cut(signature, ":")
+	return fmt.Sprintf("hashed with %s (%s)", hashType, parts)
 }

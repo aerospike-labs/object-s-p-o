@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -16,15 +17,117 @@ import (
 // Content hashing
 // ---------------------------------------------------------------------------
 
-// hashContent is applied to identifier data: each identifier node (the
-// HAS_IDENTIFIER object) and its value prop. Entity IDs, predicates and type
-// names stay readable. Hashing is deterministic, so identical data still links.
-var hashContent = func(s string) string { return s }
+// Parts that -hash-parts can hash. Identifiers are the identifier data: each
+// identifier node (the HAS_IDENTIFIER object) and its value prop. The other
+// three are the navigation parts the graph is walked by: entity IDs (subjects
+// and objects), predicates, and type names (IS_TYPE objects and the
+// identifier_type prop).
+const (
+	partIdentifiers = "identifiers"
+	partEntityIDs   = "entity-ids"
+	partPredicates  = "predicates"
+	partTypes       = "types"
+)
+
+var navigationParts = []string{partEntityIDs, partPredicates, partTypes}
+
+// readableNavigation is the navigation signature when no navigation part is
+// hashed.
+const readableNavigation = "readable"
+
+// Hash functions for each part; identity unless that part is hashed. Hashing
+// is deterministic, so identical content still links.
+var (
+	hashContent   = identity
+	hashEntityID  = identity
+	hashPredicate = identity
+	hashTypeName  = identity
+)
+
+func identity(s string) string { return s }
+
+// configureHashing sets the hash function of each part. It returns the
+// navigation signature, which runs must share for their data to link
+// ("readable", or the hash type and hashed navigation parts, e.g.
+// "sha-512:entity-ids,predicates"), and a description of what is hashed.
+func configureHashing(hashType, partList string) (navigation, desc string, err error) {
+	h, err := newHashFunc(hashType)
+	if err != nil {
+		return "", "", err
+	}
+	hashContent, hashEntityID, hashPredicate, hashTypeName = identity, identity, identity, identity
+	parts := map[string]bool{}
+	for _, p := range strings.Split(partList, ",") {
+		switch p = strings.TrimSpace(p); p {
+		case partIdentifiers, partEntityIDs, partPredicates, partTypes:
+			parts[p] = true
+		case "navigation", "all":
+			for _, n := range navigationParts {
+				parts[n] = true
+			}
+			if p == "all" {
+				parts[partIdentifiers] = true
+			}
+		case "":
+		default:
+			return "", "", fmt.Errorf("unknown hash part %q (want identifiers, entity-ids, predicates, types, navigation, or all)", p)
+		}
+	}
+	var hashedNav []string
+	for _, n := range navigationParts {
+		if parts[n] {
+			hashedNav = append(hashedNav, n)
+		}
+	}
+	if hashType == "no-hash" {
+		if len(hashedNav) > 0 {
+			return "", "", fmt.Errorf("-hash-parts %s needs -hash-type sha-256 or sha-512", strings.Join(hashedNav, ","))
+		}
+		return readableNavigation, "no-hash", nil
+	}
+
+	pick := func(part string) func(string) string {
+		if parts[part] {
+			return h
+		}
+		return identity
+	}
+	hashContent = pick(partIdentifiers)
+	hashEntityID = pick(partEntityIDs)
+	hashPredicate = pick(partPredicates)
+	hashTypeName = pick(partTypes)
+
+	var hashed []string
+	if parts[partIdentifiers] {
+		hashed = append(hashed, partIdentifiers)
+	}
+	hashed = append(hashed, hashedNav...)
+	if len(hashed) == 0 {
+		return readableNavigation, "no-hash (no -hash-parts)", nil
+	}
+	desc = hashType + " on " + strings.Join(hashed, ",")
+	if len(hashedNav) == 0 {
+		return readableNavigation, desc, nil
+	}
+	return hashType + ":" + strings.Join(hashedNav, ","), desc, nil
+}
+
+// typeNames maps each type name as stored (hashed or not) back to the
+// readable name, for reading entity types written by hashTypeName.
+func typeNames(names ...[]string) map[string]string {
+	m := make(map[string]string)
+	for _, list := range names {
+		for _, n := range list {
+			m[hashTypeName(n)] = n
+		}
+	}
+	return m
+}
 
 func newHashFunc(hashType string) (func(string) string, error) {
 	switch hashType {
 	case "no-hash":
-		return func(s string) string { return s }, nil
+		return identity, nil
 	case "sha-256":
 		return func(s string) string {
 			sum := sha256.Sum256([]byte(s))
@@ -90,7 +193,7 @@ func (a *idAllocator) Next() int64 {
 }
 
 func generateEntityID(contentType string) string {
-	return fmt.Sprintf("%s:%d", contentType, ids.Next())
+	return hashEntityID(fmt.Sprintf("%s:%d", contentType, ids.Next()))
 }
 
 func generateIdentifierValue(propName string) string {

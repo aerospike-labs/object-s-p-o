@@ -23,10 +23,10 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 
 		triples = append(triples, &model.Triple{
 			Subject:   entityID,
-			Predicate: "HAS_IDENTIFIER",
+			Predicate: hashPredicate("HAS_IDENTIFIER"),
 			Object:    hashContent(fmt.Sprintf("%s:%s", propName, value)),
 			Props: map[string]interface{}{
-				"identifier_type": propName,
+				"identifier_type": hashTypeName(propName),
 				"value":           hashContent(value),
 				"created":         now,
 				"last_seen":       now,
@@ -38,8 +38,8 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 	// Entity type triple
 	triples = append(triples, &model.Triple{
 		Subject:   entityID,
-		Predicate: "IS_TYPE",
-		Object:    contentType,
+		Predicate: hashPredicate("IS_TYPE"),
+		Object:    hashTypeName(contentType),
 		Props: map[string]interface{}{
 			"created": now,
 		},
@@ -63,7 +63,7 @@ func relationCount(pred string, rng *rand.Rand) int {
 func relationTriple(sub, pred, obj string, now int64) *model.Triple {
 	return &model.Triple{
 		Subject:   sub,
-		Predicate: pred,
+		Predicate: hashPredicate(pred),
 		Object:    obj,
 		Props: map[string]interface{}{
 			"created":   now,

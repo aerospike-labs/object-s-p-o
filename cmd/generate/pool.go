@@ -175,12 +175,14 @@ func individualPredicates(ontology []OntologyRelation) map[string]bool {
 
 // rebuildEntities scans all triples to recount INDIVIDUAL links for every
 // tracked entity and to find the highest ID. Entity types come from IS_TYPE
-// triples.
-func rebuildEntities(scan func(func(*model.Triple) error) error, pool *sharePool, ontology []OntologyRelation) ([]store.EntityLinks, int64, int, error) {
+// triples; typeName maps a stored type name back to the readable one. The
+// highest ID is 0 when entity IDs and identifiers are hashed.
+func rebuildEntities(scan func(func(*model.Triple) error) error, pool *sharePool, ontology []OntologyRelation, typeName func(string) string) ([]store.EntityLinks, int64, int, error) {
 	linkPreds := make(map[string]bool)
 	for p := range individualPredicates(ontology) {
-		linkPreds[p] = true
+		linkPreds[hashPredicate(p)] = true
 	}
+	isType := hashPredicate("IS_TYPE")
 
 	var maxID int64
 	var scanned int
@@ -195,9 +197,9 @@ func rebuildEntities(scan func(func(*model.Triple) error) error, pool *sharePool
 			}
 		}
 		switch {
-		case t.Predicate == "IS_TYPE":
-			if pool.tracked(t.Object) {
-				types[t.Subject] = t.Object
+		case t.Predicate == isType:
+			if typ := typeName(t.Object); pool.tracked(typ) {
+				types[t.Subject] = typ
 			}
 		case linkPreds[t.Predicate]:
 			links[t.Object]++
