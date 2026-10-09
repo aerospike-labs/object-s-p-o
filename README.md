@@ -76,7 +76,7 @@ Three secondary indexes are created automatically: `idx_subject`, `idx_predicate
 A standalone tool that reads JSON descriptor files and generates synthetic identity graph data at scale. Driven by three configuration files:
 
 - **`descriptors/contentTypes.json`** — defines 6 entity types (INDIVIDUAL, ACCOUNT, DISPLAY_DEVICE, ADDRESS, CREDIT_DEVICE, HOUSEHOLD), each with their own set of identifier properties and decay rates
-- **`descriptors/ontology.json`** — defines relationship rules between entity types (e.g., INDIVIDUAL → HAS_ONE_OR_MORE → ACCOUNT) with cardinality semantics
+- **`descriptors/ontology.json`** — defines relationship rules between entity types (e.g., INDIVIDUAL → HAS_ZERO_OR_MORE → ACCOUNT) with cardinality semantics
 - **`descriptors/cardinalities.json`** — how many entities of each type an INDIVIDUAL links to (e.g., 0–4 ACCOUNTs, 1–2 ADDRESSes), and how many INDIVIDUALs may share one entity (e.g., an ACCOUNT is shared by at most 4 INDIVIDUALs)
 
 ### Running the Generator
@@ -127,7 +127,7 @@ The version is the git commit the binary was built from, read from the build inf
 Each INDIVIDUAL produces ~84 triples with the default `-share-rate 0.2` (~99 with `-share-rate 0`), including:
 - **IS_TYPE** triple linking entity to its content type
 - **HAS_IDENTIFIER** triples for each property defined in contentTypes.json, with `created`, `last_seen`, and `decay` metadata
-- **Relationship triples** following ontology rules (HAS_ONE_OR_MORE, LIVES_AT, IS_PART_OF, etc.)
+- **Relationship triples** following ontology rules (HAS_ZERO_OR_MORE, HAS_ONE_OR_MORE, LIVES_AT, IS_PART_OF, etc.)
 - **Shared entities**: ~20% of INDIVIDUAL links to an ACCOUNT, ADDRESS, CREDIT_DEVICE, or DISPLAY_DEVICE reuse an existing entity (up to its `SHARE_MAX`), and ~20% of INDIVIDUALs join an existing HOUSEHOLD
 
 Average triples per INDIVIDUAL, measured over 200,000 generated INDIVIDUALs with the descriptors in `descriptors/`:
@@ -136,8 +136,9 @@ Average triples per INDIVIDUAL, measured over 200,000 generated INDIVIDUALs with
 |-----------|----------------------------:|----------------:|
 | HAS_IDENTIFIER | 58.1 | 69.8 |
 | IS_TYPE | 11.4 | 14.0 |
-| HAS_ONE_OR_MORE | 8.0 | 8.0 |
+| HAS_ONE_OR_MORE | 6.0 | 6.0 |
 | HAS | 3.2 | 4.0 |
+| HAS_ZERO_OR_MORE | 2.0 | 2.0 |
 | LIVES_AT | 1.5 | 1.5 |
 | IS_PART_OF | 1.0 | 1.0 |
 | HAS_AN | 0.8 | 1.0 |
@@ -202,7 +203,7 @@ It scans all triples, writes the `entities` set with exact link counts, and rais
 | `MIN`, `MAX` | Each INDIVIDUAL links to between `MIN` and `MAX` entities of `TYPE`, chosen uniformly (e.g., 0–4 ACCOUNTs, so ~20% of INDIVIDUALs have none). Replaces the predicate's own range for that link; optional |
 | `SHARE_MAX` | At most this many INDIVIDUALs link to one entity of `TYPE`; once reached, the entity leaves the share pool. Omitted: the type is never shared |
 
-Types without an entry use their predicate's range (HAS_ONE_OR_MORE 1–3, LIVES_AT and IS_PART_OF 1) and are never shared, except HOUSEHOLD, which is shared with no cap. Only `LINKED_TO: "INDIVIDUAL"` is supported; other entries are ignored with a warning. Files in the older format, with only `MAX`, still work: `MAX` is read as the sharing cap and the generator prints a notice.
+Types without an entry use their predicate's range (HAS_ZERO_OR_MORE 0–3, HAS_ONE_OR_MORE 1–3, LIVES_AT and IS_PART_OF 1) and are never shared, except HOUSEHOLD, which is shared with no cap. Only `LINKED_TO: "INDIVIDUAL"` is supported; other entries are ignored with a warning. Files in the older format, with only `MAX`, still work: `MAX` is read as the sharing cap and the generator prints a notice.
 
 ### Content Hashing
 
@@ -381,7 +382,7 @@ AEROSPIKE_PASSWORD=... python viewer/app.py \
 
 ### Ontology Navigation
 
-With **Ontology relationships only** checked (the default), the viewer navigates through the relationships defined in `descriptors/ontology.json` (`HAS_ONE_OR_MORE`, `LIVES_AT`, `IS_PART_OF`, `HAS`, `HAS_AN`, `CAN_HAVE_SEVERAL`) between entities such as `INDIVIDUAL:306897` and `ACCOUNT:306991`. It works the same with readable or hashed navigation; with hashed entity IDs, nodes are labelled by a shortened hash and colored by type.
+With **Ontology relationships only** checked (the default), the viewer navigates through the relationships defined in `descriptors/ontology.json` (`HAS_ZERO_OR_MORE`, `HAS_ONE_OR_MORE`, `LIVES_AT`, `IS_PART_OF`, `HAS`, `HAS_AN`, `CAN_HAVE_SEVERAL`) between entities such as `INDIVIDUAL:306897` and `ACCOUNT:306991`. It works the same with readable or hashed navigation; with hashed entity IDs, nodes are labelled by a shortened hash and colored by type.
 
 - Traversal and tap-to-expand follow only ontology relationships; identifier nodes and `IS_TYPE` type hubs are left out of the graph
 - The Predicate Filter offers only ontology relationships; selecting none follows all of them

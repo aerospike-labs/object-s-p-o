@@ -68,6 +68,7 @@ type cardinalityRange struct {
 }
 
 var predicateCardinality = map[string]cardinalityRange{
+	"HAS_ZERO_OR_MORE": {0, 3},
 	"HAS_ONE_OR_MORE":  {1, 3},
 	"LIVES_AT":         {1, 1},
 	"IS_PART_OF":       {1, 1},
