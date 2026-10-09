@@ -219,6 +219,7 @@ func main() {
 	tripleCh := make(chan []*model.Triple, *workers*4)
 	var writeWg sync.WaitGroup
 	var triplesWritten atomic.Int64
+	var entitiesWritten atomic.Int64
 	var batchErrors atomic.Int64
 
 	writeBatch := func(batch []*model.Triple) {
@@ -250,8 +251,15 @@ func main() {
 	}
 
 	// Persist entity link counts as additive deltas
+	writeEntities := func(batch []store.EntityLinks) error {
+		if err := gs.BatchAddEntityLinks(batch); err != nil {
+			return err
+		}
+		entitiesWritten.Add(int64(len(batch)))
+		return nil
+	}
 	flushEntities := func() {
-		if err := writeInBatches(pool.takeDirty(), *batchSize, gs.BatchAddEntityLinks); err != nil {
+		if err := writeInBatches(pool.takeDirty(), *batchSize, writeEntities); err != nil {
 			batchErrors.Add(1)
 			log.Printf("entity write error: %v", err)
 		}
@@ -283,11 +291,11 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				written := triplesWritten.Load()
+				written, entities := triplesWritten.Load(), entitiesWritten.Load()
 				elapsed := time.Since(startTime).Seconds()
-				rate := float64(written) / elapsed
-				fmt.Printf("\r  triples written: %d  (%.0f/sec)  errors: %d",
-					written, rate, batchErrors.Load())
+				fmt.Printf("\r  triples: %d (%.0f/sec)  entities: %d (%.0f/sec)  records: %.0f/sec  errors: %d   ",
+					written, float64(written)/elapsed, entities, float64(entities)/elapsed,
+					float64(written+entities)/elapsed, batchErrors.Load())
 			case <-done:
 				return
 			}
@@ -324,10 +332,10 @@ func main() {
 	flushEntities()
 
 	elapsed := time.Since(startTime)
-	written := triplesWritten.Load()
-	rate := float64(written) / elapsed.Seconds()
-	fmt.Printf("\n\nDone. Generated %d individuals → %d triples in %s (%.0f triples/sec)\n",
-		*count, written, elapsed.Round(time.Millisecond), rate)
+	written, entities := triplesWritten.Load(), entitiesWritten.Load()
+	fmt.Printf("\n\nDone. Generated %d individuals → %d triples + %d entity records in %s (%.0f triples/sec, %.0f records/sec)\n",
+		*count, written, entities, elapsed.Round(time.Millisecond),
+		float64(written)/elapsed.Seconds(), float64(written+entities)/elapsed.Seconds())
 	if errors := batchErrors.Load(); errors > 0 {
 		fmt.Printf("  batch errors: %d\n", errors)
 		os.Exit(1)
