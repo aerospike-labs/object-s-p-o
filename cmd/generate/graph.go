@@ -53,7 +53,11 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 // ---------------------------------------------------------------------------
 
 func relationCount(pred string, rng *rand.Rand) int {
-	card := predicateCardinality[pred]
+	return rangeCount(predicateCardinality[pred], rng)
+}
+
+// rangeCount picks a count uniformly from card.min..card.max.
+func rangeCount(card cardinalityRange, rng *rand.Rand) int {
 	if card.max > card.min {
 		return card.min + rng.Intn(card.max-card.min+1)
 	}
@@ -73,11 +77,13 @@ func relationTriple(sub, pred, obj string, now int64) *model.Triple {
 }
 
 // generateIndividualGraph returns the triples for one INDIVIDUAL and the
-// entities it creates or links to.
+// entities it creates or links to. linkRanges sets how many entities of a
+// type the INDIVIDUAL links to; other types use their predicate's range.
 func generateIndividualGraph(
 	individualID string,
 	contentTypes map[string]map[string][]PropertyMeta,
 	ontology []OntologyRelation,
+	linkRanges map[string]cardinalityRange,
 	now int64,
 	rng *rand.Rand,
 	pool *sharePool,
@@ -107,7 +113,11 @@ func generateIndividualGraph(
 		if rel.Sub != "INDIVIDUAL" {
 			continue
 		}
-		for i := relationCount(rel.Pred, rng); i > 0; i-- {
+		count := relationCount(rel.Pred, rng)
+		if r, ok := linkRanges[rel.Obj]; ok {
+			count = rangeCount(r, rng)
+		}
+		for i := count; i > 0; i-- {
 			objID, shared := pool.pick(rel.Obj, linked, rng)
 			if !shared {
 				objID = newEntity(rel.Obj)

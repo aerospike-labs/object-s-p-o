@@ -1,9 +1,9 @@
 {
 	"cardinalities":
 		[
-			{"TYPE": "ACCOUNT",        "LINKED_TO": "INDIVIDUAL", "MIN": 0, "MAX": 4},
-			{"TYPE": "ADDRESS",        "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 2},
-			{"TYPE": "CREDIT_DEVICE",  "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 4},
-			{"TYPE": "DISPLAY_DEVICE", "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 6}
+			{"TYPE": "ACCOUNT",        "LINKED_TO": "INDIVIDUAL", "MIN": 0, "MAX": 4, "SHARE_MAX": 4},
+			{"TYPE": "ADDRESS",        "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 2, "SHARE_MAX": 2},
+			{"TYPE": "CREDIT_DEVICE",  "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 4, "SHARE_MAX": 4},
+			{"TYPE": "DISPLAY_DEVICE", "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 6, "SHARE_MAX": 6}
 		]
 }

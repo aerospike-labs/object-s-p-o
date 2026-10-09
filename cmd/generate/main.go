@@ -41,12 +41,17 @@ type OntologyFile struct {
 	Ontology []OntologyRelation `json:"ontology"`
 }
 
-// Cardinality caps how many entities of LinkedTo type may link to one entity
-// of Type, e.g. one ACCOUNT is shared by at most 4 INDIVIDUALs.
+// Cardinality bounds the links between entities of LinkedTo type and
+// entities of Type: each LinkedTo entity links to Min..Max of Type (e.g. an
+// INDIVIDUAL has 0-4 ACCOUNTs), and one entity of Type is shared by at most
+// ShareMax of LinkedTo (omitted: never shared). In the old format, with
+// neither MIN nor SHARE_MAX, MAX is the sharing cap.
 type Cardinality struct {
 	Type     string `json:"TYPE"`
 	LinkedTo string `json:"LINKED_TO"`
+	Min      *int   `json:"MIN"`
 	Max      int    `json:"MAX"`
+	ShareMax *int   `json:"SHARE_MAX"`
 }
 
 type CardinalitiesFile struct {
@@ -69,6 +74,40 @@ var predicateCardinality = map[string]cardinalityRange{
 	"HAS":              {1, 3},
 	"CAN_HAVE_SEVERAL": {1, 5},
 	"HAS_AN":           {1, 1},
+}
+
+// parseCardinalities returns, per entity type, the range of links each
+// INDIVIDUAL makes to it and the most INDIVIDUALs one entity is shared by.
+// Types without a range use their predicate's; types without a cap are
+// never shared.
+func parseCardinalities(cards []Cardinality) (map[string]cardinalityRange, map[string]int, error) {
+	ranges := make(map[string]cardinalityRange)
+	caps := make(map[string]int)
+	for _, c := range cards {
+		if c.LinkedTo != "INDIVIDUAL" {
+			log.Printf("cardinality %s -> %s ignored: only INDIVIDUAL links are supported", c.Type, c.LinkedTo)
+			continue
+		}
+		switch {
+		case c.Min == nil && c.ShareMax == nil:
+			log.Printf("cardinality %s has no MIN or SHARE_MAX; using MAX %d as its sharing cap (old format)", c.Type, c.Max)
+			caps[c.Type] = c.Max
+			continue
+		case c.Min == nil && c.Max != 0:
+			return nil, nil, fmt.Errorf("cardinality %s: MAX needs MIN (MAX is the per-INDIVIDUAL range; use SHARE_MAX for the sharing cap)", c.Type)
+		case c.Min != nil && (*c.Min < 0 || c.Max < *c.Min):
+			return nil, nil, fmt.Errorf("cardinality %s: need 0 <= MIN <= MAX, got MIN %d MAX %d", c.Type, *c.Min, c.Max)
+		case c.ShareMax != nil && *c.ShareMax < 1:
+			return nil, nil, fmt.Errorf("cardinality %s: SHARE_MAX must be at least 1, got %d", c.Type, *c.ShareMax)
+		}
+		if c.Min != nil {
+			ranges[c.Type] = cardinalityRange{*c.Min, c.Max}
+		}
+		if c.ShareMax != nil {
+			caps[c.Type] = *c.ShareMax
+		}
+	}
+	return ranges, caps, nil
 }
 
 func readJSON(path string, v interface{}) {
@@ -157,7 +196,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	pool := newSharePool(*shareRate, cardFile.Cardinalities)
+	linkRanges, shareCaps, err := parseCardinalities(cardFile.Cardinalities)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pool := newSharePool(*shareRate, shareCaps)
 
 	// Entity types are stored in the entities set as written to the triples
 	// (hashed when -hash-parts includes types); the pool works with readable names
@@ -245,9 +288,20 @@ func main() {
 	}
 	fmt.Printf("  %d entities loaded, ID counter at %d\n", loaded, counter)
 	for _, c := range cardFile.Cardinalities {
-		fmt.Printf("  %-20s max %d %s, %d shareable\n", c.Type, c.Max, c.LinkedTo, len(pool.avail[c.Type]))
+		if c.LinkedTo != "INDIVIDUAL" {
+			continue
+		}
+		links := "links per predicate"
+		if r, ok := linkRanges[c.Type]; ok {
+			links = fmt.Sprintf("%d-%d per INDIVIDUAL", r.min, r.max)
+		}
+		shared := "not shared"
+		if cap, ok := shareCaps[c.Type]; ok {
+			shared = fmt.Sprintf("shared by max %d, %d shareable", cap, len(pool.avail[c.Type]))
+		}
+		fmt.Printf("  %-20s %s, %s\n", c.Type, links, shared)
 	}
-	fmt.Printf("  %-20s no limit, %d shareable\n", "HOUSEHOLD", len(pool.avail["HOUSEHOLD"]))
+	fmt.Printf("  %-20s shared without limit, %d shareable\n", "HOUSEHOLD", len(pool.avail["HOUSEHOLD"]))
 	fmt.Println()
 
 	fmt.Printf("Generating %d individuals with full entity graphs...\n", *count)
@@ -351,7 +405,7 @@ func main() {
 			rng := rand.New(rand.NewSource(seed))
 			for range genCh {
 				indID := generateEntityID("INDIVIDUAL")
-				tripleCh <- generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, now, rng, pool)
+				tripleCh <- generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, linkRanges, now, rng, pool)
 			}
 		}(rand.Int63())
 	}

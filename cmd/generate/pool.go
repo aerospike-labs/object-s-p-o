@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"math/rand"
 	"sync"
 
@@ -29,7 +28,9 @@ type sharePool struct {
 	dirty  map[string]store.EntityLinks
 }
 
-func newSharePool(rate float64, cards []Cardinality) *sharePool {
+// newSharePool shares entities of the types in caps, each by at most its cap
+// of INDIVIDUALs, and HOUSEHOLDs without limit.
+func newSharePool(rate float64, caps map[string]int) *sharePool {
 	p := &sharePool{
 		rate:   rate,
 		limits: map[string]int{"HOUSEHOLD": 0},
@@ -37,12 +38,8 @@ func newSharePool(rate float64, cards []Cardinality) *sharePool {
 		counts: make(map[string]int),
 		dirty:  make(map[string]store.EntityLinks),
 	}
-	for _, c := range cards {
-		if c.LinkedTo != "INDIVIDUAL" {
-			log.Printf("cardinality %s -> %s ignored: only INDIVIDUAL links are supported", c.Type, c.LinkedTo)
-			continue
-		}
-		p.limits[c.Type] = c.Max
+	for t, c := range caps {
+		p.limits[t] = c
 	}
 	return p
 }

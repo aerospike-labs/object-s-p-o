@@ -77,7 +77,7 @@ A standalone tool that reads JSON descriptor files and generates synthetic ident
 
 - **`descriptors/contentTypes.json`** — defines 6 entity types (INDIVIDUAL, ACCOUNT, DISPLAY_DEVICE, ADDRESS, CREDIT_DEVICE, HOUSEHOLD), each with their own set of identifier properties and decay rates
 - **`descriptors/ontology.json`** — defines relationship rules between entity types (e.g., INDIVIDUAL → HAS_ONE_OR_MORE → ACCOUNT) with cardinality semantics
-- **`descriptors/cardinalities.json`** — caps how many INDIVIDUALs may share one entity (e.g., an ACCOUNT is shared by at most 4 INDIVIDUALs, an ADDRESS by at most 2)
+- **`descriptors/cardinalities.json`** — how many entities of each type an INDIVIDUAL links to (e.g., 0–4 ACCOUNTs, 1–2 ADDRESSes), and how many INDIVIDUALs may share one entity (e.g., an ACCOUNT is shared by at most 4 INDIVIDUALs)
 
 ### Running the Generator
 
@@ -124,24 +124,24 @@ The version is the git commit the binary was built from, read from the build inf
 
 ### What It Generates
 
-Each INDIVIDUAL produces ~69 triples with the default `-share-rate 0.2` (~81 with `-share-rate 0`), including:
+Each INDIVIDUAL produces ~84 triples with the default `-share-rate 0.2` (~99 with `-share-rate 0`), including:
 - **IS_TYPE** triple linking entity to its content type
 - **HAS_IDENTIFIER** triples for each property defined in contentTypes.json, with `created`, `last_seen`, and `decay` metadata
 - **Relationship triples** following ontology rules (HAS_ONE_OR_MORE, LIVES_AT, IS_PART_OF, etc.)
-- **Shared entities**: ~20% of INDIVIDUAL links to an ACCOUNT, ADDRESS, CREDIT_DEVICE, or DISPLAY_DEVICE reuse an existing entity (up to its cardinality cap), and ~20% of INDIVIDUALs join an existing HOUSEHOLD
+- **Shared entities**: ~20% of INDIVIDUAL links to an ACCOUNT, ADDRESS, CREDIT_DEVICE, or DISPLAY_DEVICE reuse an existing entity (up to its `SHARE_MAX`), and ~20% of INDIVIDUALs join an existing HOUSEHOLD
 
 Average triples per INDIVIDUAL, measured over 200,000 generated INDIVIDUALs with the descriptors in `descriptors/`:
 
 | Predicate | `-share-rate 0.2` (default) | `-share-rate 0` |
 |-----------|----------------------------:|----------------:|
-| HAS_IDENTIFIER | 47.1 | 56.1 |
-| IS_TYPE | 9.5 | 11.6 |
-| HAS_ONE_OR_MORE | 6.0 | 6.0 |
+| HAS_IDENTIFIER | 58.1 | 69.8 |
+| IS_TYPE | 11.4 | 14.0 |
+| HAS_ONE_OR_MORE | 8.0 | 8.0 |
 | HAS | 3.2 | 4.0 |
-| LIVES_AT | 1.0 | 1.0 |
+| LIVES_AT | 1.5 | 1.5 |
 | IS_PART_OF | 1.0 | 1.0 |
 | HAS_AN | 0.8 | 1.0 |
-| **Total** | **68.6** | **80.7** |
+| **Total** | **84.0** | **99.2** |
 
 Sharing mostly removes identity triples: a shared entity's HAS_IDENTIFIER and IS_TYPE triples are written only when it is first created, and it gets no further outgoing relations. These are steady-state averages; a short run comes out slightly higher while the share pool fills. HOUSEHOLD -[CAN_HAVE_SEVERAL]-> INDIVIDUAL is in the ontology but never generated, since it is the inverse of IS_PART_OF.
 
@@ -156,7 +156,7 @@ Generators never scan the `triples` set during a load. Two small sets hold the s
 | `meta` | `id_counter` | Highest ID reserved. Each generator atomically reserves blocks of 100,000 IDs, so any number of generators on any hosts never collide |
 | `entities` | one per shareable entity | Entity ID, its (hashed) type, and how many INDIVIDUALs link to it |
 
-At startup each generator loads its slice of the `entities` set, then links ~20% of INDIVIDUAL relations to those entities, never past their cardinality cap. New link counts are written back as atomic increments every 2 seconds and at the end. Entities that reach their cap leave the pool; each pool holds up to 100,000 entities per type. HOUSEHOLDs are shared the same way with no cap.
+At startup each generator loads its slice of the `entities` set, then links ~20% of INDIVIDUAL relations to those entities, never past their `SHARE_MAX`. New link counts are written back as atomic increments every 2 seconds and at the end. Entities that reach their cap leave the pool; each pool holds up to 100,000 entities per type. HOUSEHOLDs are shared the same way with no cap.
 
 ### Initial and Incremental Loads on Multiple Hosts
 
@@ -189,15 +189,20 @@ It scans all triples, writes the `entities` set with exact link counts, and rais
 {
 	"cardinalities":
 		[
-			{"TYPE": "ACCOUNT",        "LINKED_TO": "INDIVIDUAL", "MAX": 4},
-			{"TYPE": "ADDRESS",        "LINKED_TO": "INDIVIDUAL", "MAX": 2},
-			{"TYPE": "CREDIT_DEVICE",  "LINKED_TO": "INDIVIDUAL", "MAX": 4},
-			{"TYPE": "DISPLAY_DEVICE", "LINKED_TO": "INDIVIDUAL", "MAX": 6}
+			{"TYPE": "ACCOUNT",        "LINKED_TO": "INDIVIDUAL", "MIN": 0, "MAX": 4, "SHARE_MAX": 4},
+			{"TYPE": "ADDRESS",        "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 2, "SHARE_MAX": 2},
+			{"TYPE": "CREDIT_DEVICE",  "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 4, "SHARE_MAX": 4},
+			{"TYPE": "DISPLAY_DEVICE", "LINKED_TO": "INDIVIDUAL", "MIN": 1, "MAX": 6, "SHARE_MAX": 6}
 		]
 }
 ```
 
-Types without an entry are never shared. Only `LINKED_TO: "INDIVIDUAL"` is supported; other entries are ignored with a warning.
+| Field | Meaning |
+|-------|---------|
+| `MIN`, `MAX` | Each INDIVIDUAL links to between `MIN` and `MAX` entities of `TYPE`, chosen uniformly (e.g., 0–4 ACCOUNTs, so ~20% of INDIVIDUALs have none). Replaces the predicate's own range for that link; optional |
+| `SHARE_MAX` | At most this many INDIVIDUALs link to one entity of `TYPE`; once reached, the entity leaves the share pool. Omitted: the type is never shared |
+
+Types without an entry use their predicate's range (HAS_ONE_OR_MORE 1–3, LIVES_AT and IS_PART_OF 1) and are never shared, except HOUSEHOLD, which is shared with no cap. Only `LINKED_TO: "INDIVIDUAL"` is supported; other entries are ignored with a warning. Files in the older format, with only `MAX`, still work: `MAX` is read as the sharing cap and the generator prints a notice.
 
 ### Content Hashing
 
