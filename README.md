@@ -123,11 +123,26 @@ The version is the git commit the binary was built from, read from the build inf
 
 ### What It Generates
 
-Each INDIVIDUAL produces ~80 triples including:
+Each INDIVIDUAL produces ~69 triples with the default `-share-rate 0.2` (~81 with `-share-rate 0`), including:
 - **IS_TYPE** triple linking entity to its content type
 - **HAS_IDENTIFIER** triples for each property defined in contentTypes.json, with `created`, `last_seen`, and `decay` metadata
 - **Relationship triples** following ontology rules (HAS_ONE_OR_MORE, LIVES_AT, IS_PART_OF, etc.)
 - **Shared entities**: ~20% of INDIVIDUAL links to an ACCOUNT, ADDRESS, CREDIT_DEVICE, or DISPLAY_DEVICE reuse an existing entity (up to its cardinality cap), and ~20% of INDIVIDUALs join an existing HOUSEHOLD
+
+Average triples per INDIVIDUAL, measured over 200,000 generated INDIVIDUALs with the descriptors in `descriptors/`:
+
+| Predicate | `-share-rate 0.2` (default) | `-share-rate 0` |
+|-----------|----------------------------:|----------------:|
+| HAS_IDENTIFIER | 47.1 | 56.1 |
+| IS_TYPE | 9.5 | 11.6 |
+| HAS_ONE_OR_MORE | 6.0 | 6.0 |
+| HAS | 3.2 | 4.0 |
+| LIVES_AT | 1.0 | 1.0 |
+| IS_PART_OF | 1.0 | 1.0 |
+| HAS_AN | 0.8 | 1.0 |
+| **Total** | **68.6** | **80.7** |
+
+Sharing mostly removes identity triples: a shared entity's HAS_IDENTIFIER and IS_TYPE triples are written only when it is first created, and it gets no further outgoing relations. These are steady-state averages; a short run comes out slightly higher while the share pool fills. HOUSEHOLD -[CAN_HAVE_SEVERAL]-> INDIVIDUAL is in the ontology but never generated, since it is the inverse of IS_PART_OF.
 
 ### Sharing and Incremental Runs
 
