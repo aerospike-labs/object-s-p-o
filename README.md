@@ -87,14 +87,14 @@ go run ./cmd/generate/ \
   -port 3000 \
   -namespace test \
   -count 1000000 \
-  -batch 256 \
+  -batch 1024 \
   -workers 8
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-count` | `1000` | Number of INDIVIDUALs to generate |
-| `-batch` | `256` | Batch write size |
+| `-batch` | `1024` | Batch write size |
 | `-workers` | `8` | Concurrent generator and writer goroutines |
 | `-content-types` | `descriptors/contentTypes.json` | Path to content types descriptor |
 | `-ontology` | `descriptors/ontology.json` | Path to ontology descriptor |
