@@ -216,7 +216,7 @@ Types without an entry use their predicate's range (HAS_ZERO_OR_MORE 0–3, HAS_
 | `predicates` | Every predicate, including `HAS_IDENTIFIER` and `IS_TYPE` |
 | `types` | Type names: the object of `IS_TYPE`, the `identifier_type` property, and the type stored in the `entities` set |
 
-`navigation` is shorthand for `entity-ids,predicates,types`, the parts the graph is walked by, and `all` adds `identifiers`. Numeric properties such as timestamps and decay are never hashed.
+`navigation` is shorthand for `entity-ids,predicates,types`, the parts the graph is walked by, and `all` adds `identifiers`. Numeric properties such as timestamps and decay are never hashed. The [file loader](#loaded-and-generated-data) takes the same flags.
 
 ```
 # -hash-type sha-512 (identifiers only, the default)
@@ -271,7 +271,8 @@ go build -o load ./cmd/load
 | `-props-mode` | `replace` | When a triple already exists: `replace` its props, or `merge` the new props into them |
 | `-reject-file` | | Write every rejected record, with its file, byte offset and reason, to this file |
 | `-max-errors` | `1000` | Stop after this many rejected records; `0` = no limit |
-| `-dry-run` | off | Check each file's columns and print the first triples, without connecting or writing |
+| `-dry-run` | off | Check each file's columns and print the first triples (hashed, if hashing), without connecting or writing |
+| `-hash-type`, `-hash-parts` | `no-hash`, `identifiers` | Hash loaded content as the generator does, so it links with hashed generated data. See [Loaded and Generated Data](#loaded-and-generated-data) |
 | `-client-index`, `-client-count` | `0`, `1` | Split the input between loaders on multiple hosts |
 | `-version` | off | Print the build version and exit |
 | `-namespace` | `test` | Aerospike namespace |
@@ -313,7 +314,24 @@ The primary key is the hash of subject, predicate and object, so loading is idem
 
 ### Loaded and Generated Data
 
-The loader writes triples as given and doesn't touch the generator's `meta` and `entities` sets. If a namespace holds generator data with hashed navigation, the loader warns that loaded triples won't link with it. A generator run into a namespace that already holds loaded triples refuses to start until `-rebuild-entities` has been run once.
+Loaded triples link with generated ones when they use the same readable names (`INDIVIDUAL:123`, `LIVES_AT`, ...) and the same [navigation hashing](#content-hashing). The loader takes the generator's `-hash-type` and `-hash-parts` and hashes readable values from the files the same way, so a file row and a generated triple for the same relation end up as the same record:
+
+| Part | What is hashed in loaded triples |
+|------|----------------------------------|
+| `entity-ids` | The subject, and the object unless the predicate is `IS_TYPE` or `HAS_IDENTIFIER` or the object is an N-Triples literal |
+| `predicates` | The predicate |
+| `types` | The object of `IS_TYPE`, and the `identifier_type` prop of `HAS_IDENTIFIER` triples |
+| `identifiers` | The object of `HAS_IDENTIFIER`, its `value` prop, and N-Triples literal objects |
+
+Other props are stored as they are. Like the generator, the loader records the navigation settings on the first load into a namespace and refuses a load whose settings differ from the data already there:
+
+```bash
+# namespace generated with -hash-type sha-512 -hash-parts all
+./load -load_type csv -input links.csv -subject_column ind -predicate_column rel -object_column acct \
+  -hash-type sha-512 -hash-parts all
+```
+
+The loader doesn't touch the generator's `id_counter` or `entities` sets. A generator run into a namespace that already holds loaded triples refuses to start until `-rebuild-entities` has been run once.
 
 Measured on one laptop against a single local Aerospike node: ~470K triples/sec loading CSV, ~400K/sec N-Triples, and ~330K/sec combined from two JSONL loaders on the same host.
 
@@ -529,9 +547,10 @@ ingest/writer.go     Concurrent batch writer shared by the generator and file lo
 ingest/split.go      Input discovery and line-aligned byte-range splits
 ingest/csv.go        CSV/TSV, jsonl.go JSON Lines, ntriples.go N-Triples parsers
 cmd/generate/        Content generator: main.go (flags, pipeline), graph.go (triples),
-                     pool.go (sharing, rebuild), ids.go (hashing, ID blocks)
+                     pool.go (sharing, rebuild), ids.go (ID blocks)
 cmd/queryload/       Query load generator: throughput and latency by query pattern
 cmd/load/            File loader: CSV, TSV, JSON Lines, N-Triples
+hashing/             -hash-type/-hash-parts hashing and the hash_config check, shared by generate and load
 version/             Build version (git commit) for -version
 viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)
 descriptors/         Content type, ontology, and cardinality JSON descriptors

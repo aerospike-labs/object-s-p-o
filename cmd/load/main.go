@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"graph-sub-pred-obj/hashing"
 	"graph-sub-pred-obj/ingest"
 	"graph-sub-pred-obj/model"
 	"graph-sub-pred-obj/store"
@@ -50,6 +51,8 @@ func main() {
 	rejectPath := flag.String("reject-file", "", "Write every rejected record, with its file, byte offset and reason, to this file")
 	maxRejects := flag.Int64("max-errors", 1000, "Stop after this many rejected records; 0 = no limit")
 	dryRun := flag.Bool("dry-run", false, "Check the columns of each file and print the first triples without connecting or writing")
+	hashType := flag.String("hash-type", "no-hash", "Hash function for -hash-parts: no-hash, sha-256, or sha-512")
+	hashParts := flag.String("hash-parts", hashing.PartIdentifiers, hashing.FlagHelp)
 	clientIndex := flag.Int("client-index", 0, "This loader's index (0-based) when running on multiple hosts")
 	clientCount := flag.Int("client-count", 1, "Total number of loaders sharing the same -input")
 	showVersion := flag.Bool("version", false, "Print the build version and exit")
@@ -90,6 +93,19 @@ func main() {
 		log.Fatal(err)
 	}
 
+	hasher, err := hashing.New(*hashType, *hashParts)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// hash applies -hash-type to each triple read, as the generator would
+	hash := func(t *model.Triple) *model.Triple { return t }
+	if hasher.Active() {
+		hash = func(t *model.Triple) *model.Triple {
+			literal := *loadType == "nt" && t.Props["datatype"] != nil
+			return hasher.Loaded(t, literal)
+		}
+	}
+
 	files, err := ingest.ExpandInputs(*input)
 	if err != nil {
 		log.Fatal(err)
@@ -108,8 +124,8 @@ func main() {
 			mine = append(mine, s.Path)
 		}
 	}
-	fmt.Printf("Client %d of %d: %d of %d splits from %d of %d files (%s)\n",
-		*clientIndex, *clientCount, len(splits), len(allSplits), len(mine), len(files), *loadType)
+	fmt.Printf("Client %d of %d: %d of %d splits from %d of %d files (%s, hash: %s)\n",
+		*clientIndex, *clientCount, len(splits), len(allSplits), len(mine), len(files), *loadType, hasher.Desc)
 	for _, path := range mine {
 		desc, err := parser.Check(path)
 		if err != nil {
@@ -125,7 +141,7 @@ func main() {
 	}
 
 	if *dryRun {
-		dryRunSplit(parser, splits[0])
+		dryRunSplit(parser, splits[0], hash)
 		return
 	}
 
@@ -137,11 +153,8 @@ func main() {
 	if err := gs.CreateIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
 	}
-	if nav, err := gs.GetMetaString(store.HashConfigName, "navigation"); err != nil {
-		log.Fatalf("failed to read hash config: %v", err)
-	} else if nav != "" && nav != "readable" {
-		fmt.Printf("Warning: this namespace holds generated data with hashed navigation (%s); "+
-			"loaded triples are written as given and won't link with it\n", nav)
+	if err := hashing.CheckStored(gs, hasher.Navigation); err != nil {
+		log.Fatal(err)
 	}
 
 	write := gs.BatchPutTriples
@@ -197,7 +210,7 @@ func main() {
 				if failed.Load() {
 					continue
 				}
-				if err := loadSplit(parser, s, writer, *batchSize, &rows, rejects, &failed); err != nil {
+				if err := loadSplit(parser, s, hash, writer, *batchSize, &rows, rejects, &failed); err != nil {
 					fail(err)
 				}
 			}
@@ -233,9 +246,9 @@ func main() {
 	os.Exit(exit)
 }
 
-// loadSplit parses one split, queueing its triples for writing in batches.
-// It stops early once another split has failed.
-func loadSplit(parser ingest.Parser, s ingest.Split, writer *ingest.Writer, batchSize int,
+// loadSplit parses one split, queueing its triples, hashed, for writing in
+// batches. It stops early once another split has failed.
+func loadSplit(parser ingest.Parser, s ingest.Split, hash func(*model.Triple) *model.Triple, writer *ingest.Writer, batchSize int,
 	rows *atomic.Int64, rejects *rejectLog, failed *atomic.Bool) error {
 	const rowFlush = 4096
 	var n int64
@@ -248,7 +261,7 @@ func loadSplit(parser ingest.Parser, s ingest.Split, writer *ingest.Writer, batc
 			}
 		},
 		Triple: func(t *model.Triple) error {
-			batch = append(batch, t)
+			batch = append(batch, hash(t))
 			if len(batch) == batchSize {
 				if failed.Load() {
 					return errStopped
@@ -273,13 +286,14 @@ func loadSplit(parser ingest.Parser, s ingest.Split, writer *ingest.Writer, batc
 // errStopped ends a split early because another one failed.
 var errStopped = errors.New("stopped")
 
-// dryRunSplit prints the first triples and rejects of a split.
-func dryRunSplit(parser ingest.Parser, s ingest.Split) {
+// dryRunSplit prints the first triples, hashed, and rejects of a split.
+func dryRunSplit(parser ingest.Parser, s ingest.Split, hash func(*model.Triple) *model.Triple) {
 	fmt.Printf("\nFirst triples of %s:\n", s)
 	shown, rejected := 0, 0
 	err := parser.Parse(s, ingest.Handler{
 		Row: func() {},
 		Triple: func(t *model.Triple) error {
+			t = hash(t)
 			if len(t.Props) > 0 {
 				fmt.Printf("  %s -[%s]-> %s  props=%v\n", t.Subject, t.Predicate, t.Object, t.Props)
 			} else {

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"graph-sub-pred-obj/hashing"
 	"graph-sub-pred-obj/ingest"
 	"graph-sub-pred-obj/store"
 	"graph-sub-pred-obj/version"
@@ -148,7 +149,7 @@ func main() {
 	cardinalitiesPath := flag.String("cardinalities", "descriptors/cardinalities.json", "Path to cardinalities.json")
 	shareRate := flag.Float64("share-rate", 0.2, "Probability an individual links to an existing entity instead of a new one")
 	hashType := flag.String("hash-type", "no-hash", "Hash function for -hash-parts: no-hash, sha-256, or sha-512")
-	hashParts := flag.String("hash-parts", partIdentifiers, "Comma list of what -hash-type hashes: identifiers, entity-ids, predicates, types, navigation (entity-ids,predicates,types), or all")
+	hashParts := flag.String("hash-parts", hashing.PartIdentifiers, hashing.FlagHelp)
 	clientIndex := flag.Int("client-index", 0, "This generator's index (0-based) when running on multiple hosts")
 	clientCount := flag.Int("client-count", 1, "Total number of generators running at the same time")
 	showVersion := flag.Bool("version", false, "Print the build version and exit")
@@ -161,10 +162,12 @@ func main() {
 	}
 	fmt.Println("generate", version.String())
 
-	navigation, hashDesc, err := configureHashing(*hashType, *hashParts)
+	hasher, err := hashing.New(*hashType, *hashParts)
 	if err != nil {
 		log.Fatal(err)
 	}
+	hashContent, hashEntityID, hashPredicate, hashTypeName = hasher.Content, hasher.EntityID, hasher.Predicate, hasher.TypeName
+	navigation, hashDesc := hasher.Navigation, hasher.Desc
 	if *clientCount < 1 || *clientIndex < 0 || *clientIndex >= *clientCount {
 		log.Fatalf("-client-index must be in [0, %d)", *clientCount)
 	}
@@ -193,7 +196,7 @@ func main() {
 	if err := gs.CreateIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
 	}
-	if err := checkHashConfig(gs, navigation); err != nil {
+	if err := hashing.CheckStored(gs, navigation); err != nil {
 		log.Fatal(err)
 	}
 
@@ -240,7 +243,7 @@ func main() {
 		}
 		counter, _ := gs.GetCounter(idCounterName)
 		fmt.Printf("  %d triples scanned, %d entities written, ID counter at %d\n", scanned, len(entities), counter)
-		if maxID == 0 && strings.Contains(navigation, partEntityIDs) {
+		if maxID == 0 && strings.Contains(navigation, hashing.PartEntityIDs) {
 			fmt.Println("  entity IDs are hashed, so the ID counter can't be recovered from them and was left as is")
 		}
 		return
@@ -401,54 +404,4 @@ func main() {
 		fmt.Printf("  batch errors: %d\n", errors)
 		os.Exit(1)
 	}
-}
-
-// hashConfigName is the meta record holding the navigation signature of the
-// data loaded so far: how entity IDs, predicates and type names are hashed.
-const hashConfigName = store.HashConfigName
-
-// checkHashConfig records this run's navigation signature on the first load
-// and refuses a run whose signature differs from the data already loaded,
-// since its entities, predicates and types would not link with that data.
-// Identifier hashing is not part of the signature: runs that differ only in
-// it still link.
-func checkHashConfig(gs *store.GraphStore, navigation string) error {
-	stored, err := gs.GetMetaString(hashConfigName, "navigation")
-	if err != nil {
-		return fmt.Errorf("failed to read hash config: %w", err)
-	}
-	if stored == "" {
-		existing, err := gs.SetRecordCount(store.SetName)
-		if err != nil {
-			return fmt.Errorf("failed to check for existing triples: %w", err)
-		}
-		want := navigation
-		if existing > 0 {
-			// Loaded before the signature was recorded, when navigation
-			// parts were never hashed
-			want = readableNavigation
-		}
-		if _, err := gs.CreateMetaString(hashConfigName, "navigation", want); err != nil {
-			return fmt.Errorf("failed to record hash config: %w", err)
-		}
-		// Another generator may have recorded its signature first
-		if stored, err = gs.GetMetaString(hashConfigName, "navigation"); err != nil {
-			return fmt.Errorf("failed to read hash config: %w", err)
-		}
-	}
-	if stored != navigation {
-		return fmt.Errorf("existing data has navigation %s but this run would write %s; "+
-			"runs with different navigation hashing don't link. Use the same -hash-type and "+
-			"navigation -hash-parts as the existing data, or load into an empty namespace",
-			describeNavigation(stored), describeNavigation(navigation))
-	}
-	return nil
-}
-
-func describeNavigation(signature string) string {
-	if signature == readableNavigation {
-		return "not hashed"
-	}
-	hashType, parts, _ := strings.Cut(signature, ":")
-	return fmt.Sprintf("hashed with %s (%s)", hashType, parts)
 }
