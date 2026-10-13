@@ -12,6 +12,8 @@ __pycache__/
 /generate.linux
 /queryload
 /queryload.linux
+/load
+/load.linux
 
 # Archives / packages
 *.tgz

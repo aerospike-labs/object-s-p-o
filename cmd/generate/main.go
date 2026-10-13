@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"graph-sub-pred-obj/model"
+	"graph-sub-pred-obj/ingest"
 	"graph-sub-pred-obj/store"
 	"graph-sub-pred-obj/version"
 )
@@ -308,39 +308,9 @@ func main() {
 	fmt.Printf("Generating %d individuals with full entity graphs...\n", *count)
 
 	// Pipeline: generate → batch → write
-	tripleCh := make(chan []*model.Triple, *workers*4)
-	var writeWg sync.WaitGroup
-	var triplesWritten atomic.Int64
+	writer := ingest.NewWriter(gs.BatchPutTriples, *workers, *batchSize)
 	var entitiesWritten atomic.Int64
-	var batchErrors atomic.Int64
-
-	writeBatch := func(batch []*model.Triple) {
-		if err := gs.BatchPutTriples(batch); err != nil {
-			batchErrors.Add(1)
-			log.Printf("batch write error: %v", err)
-			return
-		}
-		triplesWritten.Add(int64(len(batch)))
-	}
-
-	// Writer goroutines
-	for w := 0; w < *workers; w++ {
-		writeWg.Add(1)
-		go func() {
-			defer writeWg.Done()
-			buffer := make([]*model.Triple, 0, *batchSize)
-			for batch := range tripleCh {
-				buffer = append(buffer, batch...)
-				for len(buffer) >= *batchSize {
-					writeBatch(buffer[:*batchSize])
-					buffer = append(buffer[:0], buffer[*batchSize:]...)
-				}
-			}
-			if len(buffer) > 0 {
-				writeBatch(buffer)
-			}
-		}()
-	}
+	var batchErrors atomic.Int64 // entity write errors; writer counts triple batch errors
 
 	// Persist entity link counts as additive deltas
 	writeEntities := func(batch []store.EntityLinks) error {
@@ -383,11 +353,11 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				written, entities := triplesWritten.Load(), entitiesWritten.Load()
+				written, entities := writer.Written(), entitiesWritten.Load()
 				elapsed := time.Since(startTime).Seconds()
 				fmt.Printf("\r  triples: %d (%.0f/sec)  entities: %d (%.0f/sec)  records: %.0f/sec  errors: %d   ",
 					written, float64(written)/elapsed, entities, float64(entities)/elapsed,
-					float64(written+entities)/elapsed, batchErrors.Load())
+					float64(written+entities)/elapsed, writer.Errors()+batchErrors.Load())
 			case <-done:
 				return
 			}
@@ -406,7 +376,7 @@ func main() {
 			rng := rand.New(rand.NewSource(seed))
 			for range genCh {
 				indID := generateEntityID("INDIVIDUAL")
-				tripleCh <- generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, linkRanges, now, rng, pool)
+				writer.Add(generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, linkRanges, now, rng, pool))
 			}
 		}(rand.Int63())
 	}
@@ -417,18 +387,17 @@ func main() {
 	}
 	close(genCh)
 	genWg.Wait()
-	close(tripleCh)
-	writeWg.Wait()
+	writer.Close()
 	close(done)
 	<-flusherDone
 	flushEntities()
 
 	elapsed := time.Since(startTime)
-	written, entities := triplesWritten.Load(), entitiesWritten.Load()
+	written, entities := writer.Written(), entitiesWritten.Load()
 	fmt.Printf("\n\nDone. Generated %d individuals → %d triples + %d entity records in %s (%.0f triples/sec, %.0f records/sec)\n",
 		*count, written, entities, elapsed.Round(time.Millisecond),
 		float64(written)/elapsed.Seconds(), float64(written+entities)/elapsed.Seconds())
-	if errors := batchErrors.Load(); errors > 0 {
+	if errors := writer.Errors() + batchErrors.Load(); errors > 0 {
 		fmt.Printf("  batch errors: %d\n", errors)
 		os.Exit(1)
 	}
@@ -436,7 +405,7 @@ func main() {
 
 // hashConfigName is the meta record holding the navigation signature of the
 // data loaded so far: how entity IDs, predicates and type names are hashed.
-const hashConfigName = "hash_config"
+const hashConfigName = store.HashConfigName
 
 // checkHashConfig records this run's navigation signature on the first load
 // and refuses a run whose signature differs from the data already loaded,

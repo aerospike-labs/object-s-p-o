@@ -12,6 +12,11 @@ import (
 // MetaSetName holds generator bookkeeping, kept apart from the triples set.
 const MetaSetName = "meta"
 
+// HashConfigName is the meta record whose "navigation" bin records how the
+// generator hashed entity IDs, predicates and type names in the loaded data
+// ("readable" when not hashed).
+const HashConfigName = "hash_config"
+
 func (gs *GraphStore) counterKey(name string) (*aero.Key, aero.Error) {
 	return aero.NewKey(gs.Namespace, MetaSetName, name)
 }

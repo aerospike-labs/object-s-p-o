@@ -23,7 +23,7 @@ Plus the [connection flags](#connecting-to-aerospike).
 
 ## Connecting to Aerospike
 
-`graph-spo` and the content generator share these flags for reaching a local or remote cluster:
+`graph-spo`, the content generator, the file loader and the query load generator share these flags for reaching a local or remote cluster:
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -237,6 +237,86 @@ In the viewer, hashed values are shown as their first 20 characters plus `…` i
 
 Benchmarked at ~300K triples/sec with 8 workers on a single Aerospike node. Three generators running in parallel on one laptop against a single local node sustained ~440K triples/sec combined. Throughput scales with client hosts and cluster nodes; raise `-workers` (and `-conn-queue` a little above it) for remote clusters, where each batch spends longer on the network.
 
+## File Loader
+
+`cmd/load` loads triples from files: CSV, TSV, JSON Lines, or N-Triples. It writes the same `subject`, `predicate`, `object` and `props` bins as the generator, so whatever the source columns are called, the three secondary indexes cover the data, and the viewer and `queryload` work on it unchanged. It needs no descriptors.
+
+```bash
+go build -o load ./cmd/load
+
+# CSV/TSV: name the header columns holding the subject, predicate and object
+./load -load_type csv -input data/*.csv \
+  -subject_column cust_id -predicate_column rel_type -object_column acct_id
+
+# JSON Lines: dotted paths into each document
+./load -load_type jsonl -input events.jsonl \
+  -subject_column .person.id -predicate_column .link.kind -object_column .target.id
+
+# N-Triples: subject, predicate and object by position
+./load -load_type nt -input dump.nt
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-load_type` | | `csv`, `tsv`, `jsonl`, or `nt` |
+| `-input` | | Comma-separated files, globs, or directories (walked recursively, hidden files skipped). Files ending in `.gz` are decompressed |
+| `-subject_column`, `-predicate_column`, `-object_column` | | CSV/TSV header names (matched ignoring case and surrounding spaces), or JSONL paths such as `.person.id`. Required for `csv`, `tsv` and `jsonl`; not used with `nt` |
+| `-props_columns` | | Comma-separated further columns or paths stored in each triple's `props`, keyed by column name (paths without the leading dot, e.g. `meta.seen`) |
+| `-delimiter` | `,` (csv), tab (tsv) | Field delimiter, e.g. `\|` for pipe-delimited files |
+| `-csv-multiline` | off | CSV fields may contain quoted newlines; reads each CSV file whole instead of in splits |
+| `-split-mb` | `64` | Reads files in splits of about this many MB, in parallel; `0` reads each file whole |
+| `-readers` | CPU count | Concurrent file readers |
+| `-workers` | `8` | Concurrent writer goroutines |
+| `-batch` | `1024` | Batch write size |
+| `-props-mode` | `replace` | When a triple already exists: `replace` its props, or `merge` the new props into them |
+| `-reject-file` | | Write every rejected record, with its file, byte offset and reason, to this file |
+| `-max-errors` | `1000` | Stop after this many rejected records; `0` = no limit |
+| `-dry-run` | off | Check each file's columns and print the first triples, without connecting or writing |
+| `-client-index`, `-client-count` | `0`, `1` | Split the input between loaders on multiple hosts |
+| `-version` | off | Print the build version and exit |
+| `-namespace` | `test` | Aerospike namespace |
+
+Plus the [connection flags](#connecting-to-aerospike). Check a new file layout with `-dry-run` first: it reports the column each part of a triple comes from, or stops with the header's columns if one is missing:
+
+```
+./load -dry-run -load_type csv -input edges.csv -subject_column cust_id -predicate_column rel_type -object_column acct_id -props_columns since,score
+  edges.csv: subject="cust_id" (column 1), predicate="rel_type" (column 2), object="acct_id" (column 3), props=since,score
+
+First triples of edges.csv[0:67108864]:
+  C100 -[HAS_ACCOUNT]-> A100  props=map[score:0.134 since:2000]
+```
+
+### How Records Become Triples
+
+- **CSV/TSV:** the first row is the header. Each row is one triple. A row with an empty subject, predicate or object is rejected. Prop values that are integers or decimals in canonical form are stored as numbers (`2024`, `0.5`); others, such as `02134` or `1.50`, stay strings. TSV has no quoting: each line is split at tabs.
+- **JSON Lines:** each line is one document. A path through or ending at an array yields one value per element, and a document yields one triple per combination of subject, predicate and object values: `{"person":{"id":"p1"},"devices":[{"id":"d1"},{"id":"d2"}]}` with `-object_column .devices.id` gives two triples. Numbers and booleans are stored as strings in the subject, predicate and object, and keep their JSON types in props. A document with no value at a path, or only objects there, is rejected.
+- **N-Triples:** IRIs are stored without angle brackets and blank nodes as `_:label`. A literal object is stored as its value, with its datatype in the `datatype` prop (`xsd:string` when none is given) and its language tag, if any, in `lang`, so only literal objects have a `datatype`. N-Quads graph labels are rejected.
+
+Rejected records don't stop the load until there are more than `-max-errors`. The first 10 are printed, and `-reject-file` gets them all as `file@offset: reason: record`.
+
+### Parallel and Multi-Host Loads
+
+Each file is cut into splits of about `-split-mb`, at line boundaries, and `-readers` goroutines read splits in parallel, so a single large file loads in parallel too. Gzip files, and CSV files with `-csv-multiline`, are read whole, one split per file.
+
+To load from several hosts, give every loader the same `-input` (for example on a shared mount) and `-client-count`, and a distinct `-client-index`. Each builds the same sorted list of splits and loads every `-client-count`-th one, so the hosts share the work without coordinating through the database:
+
+```bash
+# host A                                     # host B
+./load -hosts ... -load_type jsonl \          ./load -hosts ... -load_type jsonl \
+  -input /mnt/feeds/ -subject_column ... \      -input /mnt/feeds/ -subject_column ... \
+  -client-index 0 -client-count 2               -client-index 1 -client-count 2
+```
+
+Alternatively, give each host its own files and leave `-client-count` at 1.
+
+The primary key is the hash of subject, predicate and object, so loading is idempotent: re-running a load, or loads that overlap, update the same records rather than duplicating them. Re-run a failed load as is.
+
+### Loaded and Generated Data
+
+The loader writes triples as given and doesn't touch the generator's `meta` and `entities` sets. If a namespace holds generator data with hashed navigation, the loader warns that loaded triples won't link with it. A generator run into a namespace that already holds loaded triples refuses to start until `-rebuild-entities` has been run once.
+
+Measured on one laptop against a single local Aerospike node: ~470K triples/sec loading CSV, ~400K/sec N-Triples, and ~330K/sec combined from two JSONL loaders on the same host.
+
 ## Query Load Generator
 
 `cmd/queryload` measures query throughput and latency using keys sampled from the data already loaded. It is read-only, so it can run against production-sized data and alongside generator loads to test combined query and insert traffic.
@@ -438,16 +518,20 @@ Through a link with 80 ms round trips, a 3-hop explore over 2 million triples ta
 model/triple.go      Triple struct, key hashing, type helpers
 store/client.go      Connection flags (seeds, auth, TLS, alternate access) and policies
 store/index.go       Secondary index creation
-store/writer.go      PutTriple, BatchPutTriples, DeleteTriple, UpdateTripleProperty
+store/writer.go      PutTriple, BatchPutTriples, BatchMergeTriples, DeleteTriple, UpdateTripleProperty
 store/reader.go      GetTriple, QueryBySubject/Predicate/Object, QuerySP/PO/SO, ScanAll, ScanEach
 store/meta.go        Atomic ID counter reservation (meta set)
 store/entities.go    Shareable entity link counts (entities set), partitioned scans
 graph/query.go       PatternQuery dispatcher for all 7 RDF patterns
 graph/traverse.go    BFS outbound/inbound traversal with depth limits
 ingest/loader.go     Batch and channel-based streaming ingestion
+ingest/writer.go     Concurrent batch writer shared by the generator and file loader
+ingest/split.go      Input discovery and line-aligned byte-range splits
+ingest/csv.go        CSV/TSV, jsonl.go JSON Lines, ntriples.go N-Triples parsers
 cmd/generate/        Content generator: main.go (flags, pipeline), graph.go (triples),
                      pool.go (sharing, rebuild), ids.go (hashing, ID blocks)
 cmd/queryload/       Query load generator: throughput and latency by query pattern
+cmd/load/            File loader: CSV, TSV, JSON Lines, N-Triples
 version/             Build version (git commit) for -version
 viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)
 descriptors/         Content type, ontology, and cardinality JSON descriptors
