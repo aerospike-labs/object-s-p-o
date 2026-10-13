@@ -1,0 +1,29 @@
+[Unit]
+Description=Graph S-P-O query API
+Documentation=file:///usr/local/share/doc/queryapi/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=queryapi
+Group=queryapi
+EnvironmentFile=/etc/queryapi/queryapi.env
+ExecStart=/usr/local/bin/queryapi $QUERYAPI_ARGS
+Restart=on-failure
+RestartSec=5
+# In-flight traversals finish on stop: -request-timeout plus a margin
+TimeoutStopSec=45
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

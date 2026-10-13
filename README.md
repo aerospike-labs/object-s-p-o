@@ -23,7 +23,7 @@ Plus the [connection flags](#connecting-to-aerospike).
 
 ## Connecting to Aerospike
 
-`graph-spo`, the content generator, the file loader and the query load generator share these flags for reaching a local or remote cluster:
+`graph-spo`, the content generator, the file loader, the query load generator and the query API share these flags for reaching a local or remote cluster:
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -446,6 +446,96 @@ Measured on one laptop against a single Aerospike node in Docker, with the serve
 
 Secondary index queries cost far more server CPU than primary key operations, since each consults the index in every partition. Pushing more concurrency at them past the server's capacity adds no query throughput but sharply slows inserts. For high combined rates: pace or limit secondary index query concurrency (`-qps`, `-workers`), add cluster nodes to scale secondary index throughput, and prefer primary key lookups on hot paths.
 
+## Query API
+
+`cmd/queryapi` serves an HTTP/JSON API over the triples: direct key lookups, which roles (subject, predicate, object) a value plays, pattern matches, and traversals of 1 to many hops. It runs interactively on a Mac or Linux, or as a systemd service on Linux.
+
+```bash
+go build -o queryapi ./cmd/queryapi
+./queryapi -hosts 10.0.1.10:3000 -namespace test     # Ctrl-C to stop; listens on :8090
+```
+
+Every request is served concurrently. Each traversal hop queries all of its nodes in parallel (`-query-threads` per request), and `-max-queries` caps the Aerospike queries in flight across all requests, so a burst of traversals can't swamp the cluster's query threads. Values are matched exactly as stored: with [navigation hashing](#content-hashing), pass hashed entity IDs and predicates.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /v1/triple?key=…` or `?s=…&p=…&o=…` | Key/value lookup: one triple by its key (the hex digest returned as `key`) or by subject, predicate and object. 404 when absent |
+| `GET /v1/roles?value=…` | Whether the value appears as a subject, predicate and/or object, one single-record query per role |
+| `GET /v1/lookup?value=…&as=subject,object&limit=100` | The value's triples in any combination of roles (`as`, default all three; `s`, `p`, `o` also work), each tagged with the roles it `matched`, plus a count per role and whether it has `more` |
+| `GET /v1/match?s=…&p=…&o=…&limit=100` | Triples matching any combination of subject, predicate and object, using the most selective index and filtering the rest on the server. All three is a key lookup; none is refused (it would be a full scan) |
+| `GET` or `POST /v1/traverse` | 1 or more hops from start values (below) |
+| `GET /v1/info` | Version, namespace, navigation hashing, recorded predicates, triple record count, request limits |
+| `GET /v1/health` | `{"status":"ok"}` while connected to the cluster |
+
+`lookup`, `match` and `traverse` take `predicate` (repeatable) to follow only some predicates, and `props=false` to leave out each triple's props.
+
+### Traversals
+
+A traversal walks breadth first from its start values. The first hop finds the triples in which a start value plays the roles in `as`; each later hop follows `direction` from the nodes the previous hop reached: `out` (node as subject, on to its objects), `in` (node as object, back to its subjects), or `both`. Nodes are visited once, so cycles end.
+
+```bash
+# GET: repeat start and predicate for several values
+curl -G localhost:8090/v1/traverse -d start=Plane -d hops=3 -d direction=out -d predicate=hasA
+
+# POST: the same fields as JSON
+curl -X POST localhost:8090/v1/traverse -d '{
+  "start": ["Rudder"], "hops": 2, "direction": "both",
+  "as": ["subject", "object"], "max_degree": 1000, "max_triples": 10000, "props": false
+}'
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `start` | | Start values (required) |
+| `hops` | `-default-hops` (1) | Hops to walk, 1 to `-max-hops` |
+| `direction` | `out` | `out`, `in`, or `both` |
+| `as` | the roles `direction` follows | Roles of the start values in the first hop: any of `subject`, `predicate`, `object`. `predicate` starts from every triple with that predicate |
+| `predicates` | all | Follow only these predicates |
+| `max_degree` | `-max-degree` (1000) | Triples fetched per node and direction. A node past the first hop with more is a hub: listed with `"hub": true` but not expanded, as in the [viewer](#hub-limit). A start value with more is followed for its first `max_degree` and marked `truncated` |
+| `max_triples` | `-default-triples` (10000) | Triples returned at most; reaching it sets `truncated` |
+| `props` | `true` | Include each triple's props |
+
+The response lists the `nodes` reached, with the hop `depth` they were found at, and the `triples`, each with its `hop`, the node it was reached `from`, and the role that node plays in it (`via`). `queries` counts the index queries run. A traversal still running at `-request-timeout` returns what it has with `timed_out` set.
+
+```json
+{"nodes": [{"id": "Rudder", "depth": 0}, {"id": "Yaw", "depth": 1}, ...],
+ "triples": [{"key": "…", "subject": "Rudder", "predicate": "changes", "object": "Yaw",
+              "hop": 1, "from": "Rudder", "via": "subject"}, ...],
+ "truncated": false, "queries": 6, "elapsed": "2.1ms"}
+```
+
+### Running as a systemd Service
+
+`build.sh` puts `queryapi.linux` and `deploy/` in `bundle.client.tar`. On the Linux host, from the unpacked bundle:
+
+```bash
+sudo ./deploy/install.sh                  # installs, enables at boot, starts
+sudo vi /etc/queryapi/queryapi.env        # set -hosts, -namespace and any other flags
+sudo systemctl restart queryapi
+journalctl -u queryapi -f                 # one log line per request
+sudo ./deploy/install.sh uninstall        # stops and removes; keeps /etc/queryapi
+```
+
+The service runs as the unprivileged `queryapi` user with a read-only view of the system, restarts on failure, and on stop lets in-flight requests finish. Settings are the flags in `QUERYAPI_ARGS`; for a cluster with security, add `-user` there and set `AEROSPIKE_PASSWORD` in the same file (mode 0640). Re-running `install.sh` upgrades the binary and keeps the settings. The API has no authentication of its own: bind it to a private address (`-listen 10.0.1.5:8090`) or put it behind a proxy that authenticates.
+
+### Query API Flags
+
+Besides the [connection flags](#connecting-to-aerospike) and `-namespace`:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-listen` | `:8090` | HTTP listen address |
+| `-max-queries` | `128` | Aerospike queries in flight across all requests |
+| `-query-threads` | `16` | Concurrent queries per traversal hop |
+| `-short-queries` | off | Run index queries as short queries: fastest when results are small (`max_degree` under ~100) |
+| `-query-timeout` | `10s` | Timeout of each Aerospike query |
+| `-request-timeout` | `30s` | Time a traversal may take before it returns what it has |
+| `-max-hops`, `-default-hops` | `6`, `1` | Most hops a traversal may ask for, and hops when it gives none |
+| `-max-degree` | `1000` | Default `max_degree` |
+| `-default-limit`, `-max-limit` | `100`, `10000` | Default `limit` of `lookup` and `match`, and the largest `limit` or `max_degree` a request may set |
+| `-default-triples`, `-max-triples` | `10000`, `100000` | Default and largest `max_triples` of a traversal |
+| `-version` | off | Print the build version and exit |
+
 ## Interactive Graph Viewer
 
 A web-based property graph viewer built with Python, Dash, and Cytoscape. Connects directly to Aerospike and provides interactive visualization of RDF relationships.
@@ -539,8 +629,9 @@ model/triple.go      Triple struct, key hashing, type helpers
 store/client.go      Connection flags (seeds, auth, TLS, alternate access) and policies
 store/index.go       Secondary index creation
 store/writer.go      PutTriple, BatchPutTriples, BatchMergeTriples, DeleteTriple, UpdateTripleProperty
-store/reader.go      GetTriple, QueryBySubject/Predicate/Object, QuerySP/PO/SO, ScanAll, ScanEach
+store/reader.go      GetTriple, GetTripleByKey, QueryBySubject/Predicate/Object, QuerySP/PO/SO, ScanAll, ScanEach
 store/meta.go        Atomic ID counter reservation (meta set)
+store/predicates.go  Distinct predicates recorded in the meta set
 store/entities.go    Shareable entity link counts (entities set), partitioned scans
 graph/query.go       PatternQuery dispatcher for all 7 RDF patterns
 graph/traverse.go    BFS outbound/inbound traversal with depth limits
@@ -552,6 +643,8 @@ cmd/generate/        Content generator: main.go (flags, pipeline), graph.go (tri
                      pool.go (sharing, rebuild), ids.go (ID blocks)
 cmd/queryload/       Query load generator: throughput and latency by query pattern
 cmd/load/            File loader: CSV, TSV, JSON Lines, N-Triples
+cmd/queryapi/        HTTP/JSON query API: lookups, roles, pattern matches, multi-hop traversals
+deploy/              systemd unit, settings file and installer for the query API
 hashing/             -hash-type/-hash-parts hashing and the hash_config check, shared by generate and load
 version/             Build version (git commit) for -version
 viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)

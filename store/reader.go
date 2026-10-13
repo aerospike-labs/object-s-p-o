@@ -7,20 +7,10 @@ import (
 )
 
 // GetTriple performs a direct primary key lookup (fastest path, sub-ms).
+// Returns nil when there is no such triple.
 func (gs *GraphStore) GetTriple(subject, predicate, object string) (*model.Triple, error) {
 	t := &model.Triple{Subject: subject, Predicate: predicate, Object: object}
-	key, err := aero.NewKey(gs.Namespace, SetName, t.Key())
-	if err != nil {
-		return nil, err
-	}
-	rec, err := gs.Client.Get(nil, key)
-	if err != nil {
-		return nil, err
-	}
-	if rec == nil {
-		return nil, nil
-	}
-	return recordToTriple(rec), nil
+	return gs.GetTripleByKey(t.Key())
 }
 
 // QueryBySubject returns all triples for a given subject (S?? pattern).
@@ -181,4 +171,37 @@ func recordToTriple(rec *aero.Record) *model.Triple {
 	}
 
 	return t
+}
+
+// GetTripleByKey looks up a triple by its primary key, the hex digest that
+// model.Triple.Key returns. Returns nil when there is no such triple.
+func (gs *GraphStore) GetTripleByKey(tripleKey string) (*model.Triple, error) {
+	key, err := aero.NewKey(gs.Namespace, SetName, tripleKey)
+	if err != nil {
+		return nil, err
+	}
+	rec, aerr := gs.Client.Get(nil, key)
+	if aerr != nil {
+		if aerr.Matches(aero.ErrKeyNotFound.ResultCode) {
+			return nil, nil
+		}
+		return nil, aerr
+	}
+	return recordToTriple(rec), nil
+}
+
+// PredicatesFilter returns a server-side filter matching any of the
+// predicates, or nil (no filter) when there are none.
+func PredicatesFilter(predicates []string) *aero.Expression {
+	switch len(predicates) {
+	case 0:
+		return nil
+	case 1:
+		return PredicateFilter(predicates[0])
+	}
+	terms := make([]*aero.Expression, len(predicates))
+	for i, p := range predicates {
+		terms[i] = PredicateFilter(p)
+	}
+	return aero.ExpOr(terms...)
 }
