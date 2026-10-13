@@ -70,6 +70,8 @@ DEFAULT_CONTENT_TYPES = os.path.join(DESCRIPTORS, "contentTypes.json")
 # "sha-512:entity-ids,predicates,types".
 META_SET = "meta"
 HASH_CONFIG_KEY = "hash_config"
+# Meta record whose "names" map holds every predicate written, as stored.
+PREDICATES_KEY = "predicates"
 HASH_FUNCS = {
     "sha-256": lambda s: hashlib.sha256(s.encode()).hexdigest(),
     "sha-512": lambda s: hashlib.sha512(s.encode()).hexdigest(),
@@ -105,6 +107,17 @@ def read_navigation(client, namespace):
     except aerospike.exception.RecordNotFound:
         return "readable"
     return bins.get("navigation") or "readable"
+
+
+def read_predicates(client, namespace):
+    """Every predicate the loader and generator have written, as stored, from
+    the meta set; empty when none are recorded (data written before they were,
+    until load -rebuild-predicates is run)."""
+    try:
+        _, _, bins = client.get((namespace, META_SET, PREDICATES_KEY))
+    except aerospike.exception.RecordNotFound:
+        return []
+    return sorted(bins.get("names") or {})
 
 
 class Navigation:
@@ -674,11 +687,16 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path
                  (Output("refresh-status", "children"), f"Sampling up to {sample_size:,} triples...", "")],
     )
     def refresh_dropdowns(n_clicks):
-        nodes, predicates, types = sample_graph(client, namespace, sample_size, is_type)
+        nodes, sampled, types = sample_graph(client, namespace, sample_size, is_type)
+        recorded = read_predicates(client, namespace)
+        # Recorded predicates are complete for data written since they were
+        # recorded; the sample covers older data not yet rebuilt
+        predicates = sorted(set(recorded) | set(sampled))
         node_cache[:] = nodes
         if nav.entity_ids_hashed:
             type_cache.update({n: nav.label(t) for n, t in types.items()})
-        status = (f"Sampled {len(nodes):,} nodes, {len(predicates)} predicates. "
+        status = (f"Sampled {len(nodes):,} nodes; {len(predicates)} predicates "
+                  f"({len(recorded)} recorded, {len(sampled)} sampled). "
                   f"Type a full node ID to find any node. {nav.describe()}.")
         return predicates, status
 

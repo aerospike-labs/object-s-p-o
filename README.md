@@ -155,6 +155,7 @@ Generators never scan the `triples` set during a load. Two small sets hold the s
 | Set | Record | Contents |
 |-----|--------|----------|
 | `meta` | `id_counter` | Highest ID reserved. Each generator atomically reserves blocks of 100,000 IDs, so any number of generators on any hosts never collide |
+| `meta` | `predicates` | Every distinct predicate written, as stored. Writers add a predicate the first time they write it, so the viewer lists predicates without a scan |
 | `entities` | one per shareable entity | Entity ID, its (hashed) type, and how many INDIVIDUALs link to it |
 
 At startup each generator loads its slice of the `entities` set, then links ~20% of INDIVIDUAL relations to those entities, never past their `SHARE_MAX`. New link counts are written back as atomic increments every 2 seconds and at the end. Entities that reach their cap leave the pool; each pool holds up to 100,000 entities per type. HOUSEHOLDs are shared the same way with no cap.
@@ -272,6 +273,7 @@ go build -o load ./cmd/load
 | `-reject-file` | | Write every rejected record, with its file, byte offset and reason, to this file |
 | `-max-errors` | `1000` | Stop after this many rejected records; `0` = no limit |
 | `-dry-run` | off | Check each file's columns and print the first triples (hashed, if hashing), without connecting or writing |
+| `-rebuild-predicates` | off | Scan every triple and record its predicate in the `meta` set, then exit. Run once for data written before predicates were recorded (`-rebuild-entities` in the generator does this too) |
 | `-hash-type`, `-hash-parts` | `no-hash`, `identifiers` | Hash loaded content as the generator does, so it links with hashed generated data. See [Loaded and Generated Data](#loaded-and-generated-data) |
 | `-client-index`, `-client-count` | `0`, `1` | Split the input between loaders on multiple hosts |
 | `-version` | off | Print the build version and exit |
@@ -505,7 +507,7 @@ Change the threshold with `MAX_EXPAND_DEGREE` at the top of `viewer/app.py`.
 
 The viewer is built to stay responsive against millions of triples and remote clusters, where every round trip and every row crosses the network:
 
-- **No full scans.** On page load (and Refresh Data) the viewer samples up to `--sample-size` triples (default 100,000) for the node search list and predicate filter, instead of scanning the whole set. Nodes outside the sample are found by typing their full ID.
+- **No full scans.** On page load (and Refresh Data) the viewer samples up to `--sample-size` triples (default 100,000) for the node search list and predicate filter, instead of scanning the whole set. Nodes outside the sample are found by typing their full ID. The predicate filter also lists every predicate recorded in the `meta` set, so it is complete for any data written by the loader or generator, or covered by `load -rebuild-predicates`.
 - **Capped queries.** Each node fetches at most 1,000 edges per direction (`HUB_COUNT_CAP`), so a type node with millions of edges costs the same as one with 1,000. The predicate filter is applied on the server, so filtered-out edges never cross the network.
 - **Parallel traversal.** Each hop's nodes are queried concurrently (`QUERY_THREADS`, default 16), so a hop costs about one round trip instead of one per node.
 

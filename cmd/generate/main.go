@@ -14,6 +14,7 @@ import (
 
 	"graph-sub-pred-obj/hashing"
 	"graph-sub-pred-obj/ingest"
+	"graph-sub-pred-obj/model"
 	"graph-sub-pred-obj/store"
 	"graph-sub-pred-obj/version"
 )
@@ -231,9 +232,25 @@ func main() {
 
 	if *rebuild {
 		fmt.Println("Rebuilding entities set from existing triples...")
-		entities, maxID, scanned, err := rebuildEntities(gs.ScanEach, pool, ontFile.Ontology, typeName)
+		predicates := map[string]bool{}
+		scan := func(fn func(*model.Triple) error) error {
+			return gs.ScanEach(func(t *model.Triple) error {
+				predicates[t.Predicate] = true
+				return fn(t)
+			})
+		}
+		entities, maxID, scanned, err := rebuildEntities(scan, pool, ontFile.Ontology, typeName)
 		if err != nil {
 			log.Fatalf("failed to scan triples: %v", err)
+		}
+		if len(predicates) > 0 {
+			names := make([]string, 0, len(predicates))
+			for p := range predicates {
+				names = append(names, p)
+			}
+			if err := gs.RecordPredicates(names); err != nil {
+				log.Fatalf("failed to record predicates: %v", err)
+			}
 		}
 		if err := writeInBatches(storedTypes(entities), *batchSize, gs.BatchPutEntityLinks); err != nil {
 			log.Fatalf("failed to write entities: %v", err)
@@ -242,7 +259,7 @@ func main() {
 			log.Fatalf("failed to raise ID counter: %v", err)
 		}
 		counter, _ := gs.GetCounter(idCounterName)
-		fmt.Printf("  %d triples scanned, %d entities written, ID counter at %d\n", scanned, len(entities), counter)
+		fmt.Printf("  %d triples scanned, %d entities written, %d predicates recorded, ID counter at %d\n", scanned, len(entities), len(predicates), counter)
 		if maxID == 0 && strings.Contains(navigation, hashing.PartEntityIDs) {
 			fmt.Println("  entity IDs are hashed, so the ID counter can't be recovered from them and was left as is")
 		}

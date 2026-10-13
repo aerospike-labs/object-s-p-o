@@ -55,6 +55,7 @@ func main() {
 	hashParts := flag.String("hash-parts", hashing.PartIdentifiers, hashing.FlagHelp)
 	clientIndex := flag.Int("client-index", 0, "This loader's index (0-based) when running on multiple hosts")
 	clientCount := flag.Int("client-count", 1, "Total number of loaders sharing the same -input")
+	rebuildPreds := flag.Bool("rebuild-predicates", false, "Record the predicates of all existing triples in the meta set, then exit (for data written before predicates were recorded)")
 	showVersion := flag.Bool("version", false, "Print the build version and exit")
 	flag.Parse()
 
@@ -63,6 +64,25 @@ func main() {
 		return
 	}
 	fmt.Println("load", version.String())
+
+	if *rebuildPreds {
+		gs, err := conn.Connect(*namespace)
+		if err != nil {
+			log.Fatalf("failed to connect: %v", err)
+		}
+		defer gs.Close()
+		fmt.Println("Recording predicates of existing triples...")
+		scanned, err := gs.RebuildPredicates()
+		if err != nil {
+			log.Fatalf("failed to scan triples: %v", err)
+		}
+		preds, err := gs.Predicates()
+		if err != nil {
+			log.Fatalf("failed to read predicates: %v", err)
+		}
+		fmt.Printf("  %d triples scanned, %d predicates recorded\n", scanned, len(preds))
+		return
+	}
 
 	if *input == "" {
 		log.Fatal("-input is required")

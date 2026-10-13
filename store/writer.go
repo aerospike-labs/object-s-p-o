@@ -10,6 +10,9 @@ import (
 
 // PutTriple writes a single triple to Aerospike with upsert semantics.
 func (gs *GraphStore) PutTriple(t *model.Triple) error {
+	if err := gs.recordNewPredicates([]*model.Triple{t}); err != nil {
+		return err
+	}
 	key, err := aero.NewKey(gs.Namespace, SetName, t.Key())
 	if err != nil {
 		return err
@@ -48,6 +51,10 @@ func (gs *GraphStore) BatchMergeTriples(triples []*model.Triple) error {
 }
 
 func (gs *GraphStore) batchWriteTriples(triples []*model.Triple, propsOp func(map[string]interface{}) *aero.Operation) error {
+	if err := gs.recordNewPredicates(triples); err != nil {
+		return err
+	}
+
 	records := make([]aero.BatchRecordIfc, 0, len(triples))
 
 	bwp := aero.NewBatchWritePolicy()

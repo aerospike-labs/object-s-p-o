@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	aero "github.com/aerospike/aerospike-client-go/v8"
 )
@@ -21,6 +22,9 @@ type GraphStore struct {
 	WritePolicy *aero.WritePolicy
 	QueryPolicy *aero.QueryPolicy
 	BatchPolicy *aero.BatchPolicy
+
+	// Predicates this client has recorded in the predicates meta record
+	predicates sync.Map
 }
 
 // ConnConfig describes how to reach a local or remote Aerospike cluster.
