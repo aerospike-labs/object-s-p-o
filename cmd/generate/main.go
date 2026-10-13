@@ -258,6 +258,11 @@ func main() {
 		if err := gs.RaiseCounter(idCounterName, maxID); err != nil {
 			log.Fatalf("failed to raise ID counter: %v", err)
 		}
+		// Record the counter even when no generated IDs were found, as with
+		// loaded data only, so that later generator runs proceed
+		if _, err := gs.ReserveCounter(idCounterName, 0); err != nil {
+			log.Fatalf("failed to record ID counter: %v", err)
+		}
 		counter, _ := gs.GetCounter(idCounterName)
 		fmt.Printf("  %d triples scanned, %d entities written, %d predicates recorded, ID counter at %d\n", scanned, len(entities), len(predicates), counter)
 		if maxID == 0 && strings.Contains(navigation, hashing.PartEntityIDs) {
@@ -267,11 +272,11 @@ func main() {
 	}
 
 	// Refuse to write over data loaded before the ID counter existed
-	counter, err := gs.GetCounter(idCounterName)
+	counterSet, err := gs.CounterExists(idCounterName)
 	if err != nil {
 		log.Fatalf("failed to read ID counter: %v", err)
 	}
-	if counter == 0 {
+	if !counterSet {
 		existing, err := gs.SetRecordCount(store.SetName)
 		if err != nil {
 			log.Fatalf("failed to check for existing triples: %v", err)
@@ -279,6 +284,10 @@ func main() {
 		if existing > 0 {
 			log.Fatalf("%d triples exist but the ID counter is unset; run once with -rebuild-entities first", existing)
 		}
+	}
+	counter, err := gs.GetCounter(idCounterName)
+	if err != nil {
+		log.Fatalf("failed to read ID counter: %v", err)
 	}
 	ids.reserve = func(n int64) (int64, error) { return gs.ReserveCounter(idCounterName, n) }
 

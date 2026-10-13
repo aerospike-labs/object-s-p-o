@@ -61,6 +61,15 @@ func (gs *GraphStore) GetCounter(name string) (int64, error) {
 	return 0, nil
 }
 
+// CounterExists reports whether the named counter has been set, even to 0.
+func (gs *GraphStore) CounterExists(name string) (bool, error) {
+	key, err := gs.counterKey(name)
+	if err != nil {
+		return false, err
+	}
+	return gs.Client.Exists(nil, key)
+}
+
 // ReserveCounter atomically adds n to the named counter and returns the new
 // value, so the caller owns the range (value-n, value]. Safe across hosts.
 func (gs *GraphStore) ReserveCounter(name string, n int64) (int64, error) {
