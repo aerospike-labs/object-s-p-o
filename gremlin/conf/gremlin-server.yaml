@@ -1,6 +1,14 @@
 # Gremlin Server over the vertex model in Aerospike. Start with ./run.sh;
 # gdotv and other Gremlin clients connect to ws://localhost:8182/gremlin, traversal source g.
-host: 0.0.0.0
+#
+# The server runs Groovy scripts sent by any client that can reach it, with the JVM's
+# privileges, and has no authentication: it listens on localhost only. Before binding to
+# another interface, turn on authentication and TLS, for example:
+#   authentication: {
+#     authenticator: org.apache.tinkerpop.gremlin.server.auth.SimpleAuthenticator,
+#     config: { credentialsDb: conf/tinkergraph-credentials.properties }}
+#   ssl: { enabled: true, keyStore: conf/server.jks, keyStorePassword: changeit }
+host: 127.0.0.1
 port: 8182
 evaluationTimeout: 120000
 graphs: {

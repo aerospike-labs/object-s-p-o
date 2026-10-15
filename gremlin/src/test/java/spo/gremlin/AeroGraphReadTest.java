@@ -12,6 +12,7 @@ import com.aerospike.client.cdt.MapPolicy;
 import com.aerospike.client.cdt.MapWriteFlags;
 import com.aerospike.client.policy.RecordExistsAction;
 import com.aerospike.client.policy.WritePolicy;
+import org.apache.commons.configuration2.BaseConfiguration;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.junit.jupiter.api.AfterAll;
@@ -53,6 +54,7 @@ class AeroGraphReadTest {
         WritePolicy create = new WritePolicy();
         create.recordExistsAction = RecordExistsAction.CREATE_ONLY;
         try {
+            client.put(create, new Key(ns, "meta", "lpg_format"), new Bin("format", AeroGraph.FORMAT));
             client.put(create, new Key(ns, "meta", "lpg_config"), new Bin("id_buckets", "16777216"));
         } catch (Exception ignored) {
             // already configured
@@ -83,9 +85,30 @@ class AeroGraphReadTest {
             putEdge(t, "in_edges", "LINKS", h2, List.of(1000L + i, 1000L + i));
         }
 
+        put(p + PIPE_ID, new Bin("type", "ACCOUNT"));
+        putEdge(p + PIPE_ID, "out_edges", "LINKS", p + "T0", List.of(7L, 7L));
+
         graph = AeroGraph.open(System.getenv("LPG_TEST_HOST"), ns);
         g = traversal().withEmbedded(graph);
+
+        // V1 holds an identifier left out of the index, as a writer with -id-index=false leaves it
+        put(p + "V1", new Bin("type", "INDIVIDUAL"),
+                new Bin("identifiers", Map.of("EMAIL_E", Map.of(p + "mail", List.of(1L, 1L, 0.0)))));
+        // V2 holds an identifier whose index tag is full, and isn't among the vertices it keeps
+        put(p + "V2", new Bin("type", "INDIVIDUAL"),
+                new Bin("identifiers", Map.of("PHONE_E", Map.of(p + "shared", List.of(1L, 1L, 0.0)))));
+        long[] slot = AeroGraph.identifierSlot("PHONE_E", p + "shared", graph.idBuckets);
+        Map<Value, Value> full = new java.util.HashMap<>();
+        for (int i = 0; i < AeroGraph.MAX_IDENTIFIER_SHARE; i++) {
+            full.put(Value.get(p + "F" + i), Value.get(1L));
+        }
+        client.operate(null, new Key(ns, "identifier_index", slot[0]),
+                MapOperation.putItems(new MapPolicy(MapOrder.KEY_ORDERED, MapWriteFlags.DEFAULT), "vertices_by_tag", full,
+                        CTX.mapKeyCreate(Value.get(slot[1]), MapOrder.KEY_ORDERED)));
     }
+
+    /** A vertex id with the edge id separator and escape in it. */
+    static final String PIPE_ID = "A|B\\C";
 
     /** An edge bucket key, as lpg/store.go and AeroGraph.edgeBucketKey build it. */
     private static Key bucketKey(String id, boolean outgoing, int level, long bucket) {
@@ -134,6 +157,51 @@ class AeroGraphReadTest {
         assertEquals(1L, g.E(p + "H2|LINKS|" + p + "T45").count().next()); // bucket level 1
         assertEquals(1L, g.E(p + "H2|LINKS|" + p + "T3").count().next());  // bucket level 0
         assertEquals(0L, g.E(p + "H2|LINKS|" + p + "T99").count().next());
+    }
+
+    @Test
+    void edgeIdsRoundTripWithSeparatorsInIds() {
+        Object id = g.V(p + PIPE_ID).outE("LINKS").id().next();
+        assertEquals(List.of(p + PIPE_ID), g.E(id).outV().id().toList());
+        assertEquals(List.of(p + "T0"), g.E(id).inV().id().toList());
+        assertEquals("LINKS", g.E(id).label().next());
+    }
+
+    @Test
+    void countWithTwoLabelsAppliesBoth() {
+        assertEquals(0L, g.V().hasLabel("HOUSEHOLD").hasLabel("ACCOUNT").count().next());
+        assertTrue(g.V().hasLabel("HOUSEHOLD").count().next() >= 1L);
+    }
+
+    @Test
+    void identifierLookupScansWhenTheIndexIsIncomplete() {
+        BaseConfiguration c = new BaseConfiguration();
+        c.setProperty("aerospike.hosts", System.getenv("LPG_TEST_HOST"));
+        c.setProperty("aerospike.namespace", ns);
+        c.setProperty("aerospike.cache.ttl.ms", 0);
+        Key off = new Key(ns, "meta", AeroGraph.ID_INDEX_OFF);
+        try (AeroGraph fresh = AeroGraph.open(c)) {
+            GraphTraversalSource g2 = traversal().withEmbedded(fresh);
+            boolean wasOff = client.exists(null, off);
+            if (!wasOff) {
+                assertEquals(0L, g2.V().has("EMAIL_E", p + "mail").count().next()); // the index is trusted
+                client.put(null, off, new Bin("off", true));
+            }
+            try {
+                assertEquals(List.of(p + "V1"), g2.V().has("EMAIL_E", p + "mail").id().toList());
+            } finally {
+                if (!wasOff) {
+                    client.delete(null, off);
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Test
+    void identifierLookupScansWhenATagIsFull() {
+        assertEquals(List.of(p + "V2"), g.V().has("PHONE_E", p + "shared").id().toList());
     }
 
     @Test

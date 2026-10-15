@@ -271,12 +271,14 @@ go run ./cmd/generate/ -model lpg -count 1000000 -workers 16
 | `edge_buckets` | `<entity ID>\|<out or in>\|<level>\|<bucket>` | `vertex_id`, `edges` (`{predicate: {neighbor: [created, last_seen]}}`), `edge_count`: a hub's edges beyond its record |
 | `identifier_index` | Bucket number | `vertices_by_tag`: `{tag: {vertex ID: created}}`, where bucket and 64-bit tag come from a SHA-256 of the identifier's type and value |
 | `meta` | `lpg_config` | `id_buckets`: the bucket count, fixed by the first load |
+| `meta` | `lpg_format` | `format`: the layout version, `2` |
+| `meta` | `lpg_id_index_off` | Present once a writer has run with `-id-index=false`: lookups by identifier scan |
 
 Aerospike stores set and bin names in every record, so descriptive names cost about 47 B per vertex over one- and two-letter names (measured: 678 B against 632 B a vertex): roughly 3.2 TB more on device for 34B vertices at RF 2, and nothing in index memory. There are no secondary indexes: reads are key lookups and batch reads that go straight to the node owning each key.
 
 ### High-Degree Vertices (Hubs)
 
-A vertex record takes edges until it holds `-max-inline-edges` entries (default 256, counted in `edge_count`). The write that would pass the limit promotes the vertex to a hub, and from then on its new edges go to `edge_buckets`, one direction at a time; the edges already in its record stay there.
+A vertex record takes edges until it holds `-max-inline-edges` entries (default 256, counted in `edge_count`). The write that would pass the limit promotes the vertex to a hub, and from then on its new edges in both directions go to `edge_buckets`; the edges already in its record stay there, and are updated in place when written again.
 
 A hub's edges in a direction are spread over levels of buckets. Level *k* has 16·2^*k* buckets, and an edge goes to bucket FNV-1a(neighbor) mod that count, so every writer and reader agrees on where an edge is without reading anything first. Bucket writes carry a filter expression on the bucket's `edge_count`; when a bucket of the newest level reaches 256 entries, the writer moves the hub to the next level, which has twice the buckets, with a compare-and-set on `hub_in_level` or `hub_out_level`. Nothing is ever rehashed or moved, so a hub keeps taking writes while it grows. 1M edges take 9 levels (8,176 buckets); 10M take 12 (65,520 buckets).
 
@@ -290,7 +292,7 @@ What each read costs:
 | A traversal through a hub | Reads at most `max-degree`+1 of its edges to find it is a hub, then doesn't expand it |
 | All edges, or an exact degree | Every bucket: this is the read that grows with the hub |
 
-New edges spread over all buckets of the newest level, so concurrent writers to one hub don't queue on one record; only the hub's own `indiv_links` counter is a single record. An edge written again after its hub moved up a level lands in the new level too, so all-edge reads can see it twice (the newest copy last) and degree counts it twice. With the default descriptors no vertex becomes a hub, since sharing caps keep degrees small: use [`-hubs`](#supernodes) to grow some.
+New edges spread over all buckets of the newest level, so concurrent writers to one hub don't queue on one record; only the hub's own `indiv_links` counter is a single record. Before writing, the writer looks each edge up where it could already be (inline, and the one bucket per level it hashes to), so an edge written again is merged where it is and never stored twice. With the default descriptors no vertex becomes a hub, since sharing caps keep degrees small: use [`-hubs`](#supernodes) to grow some.
 
 A vertex known to be a supernode can be promoted before it has any edges (`Store.PromoteHub`, which `-hubs` does for its hubs), as AGS's `~supernode` designation does: its edges then go to buckets from the first one, instead of filling its record first.
 
@@ -298,7 +300,15 @@ A vertex known to be a supernode can be promoted before it has any edges (`Store
 
 `identifier_index` replaces the object index for finding a vertex by identifier: one read of the identifier's bucket gives the candidate vertices, and a batch read confirms each holds the identifier. Size `-id-buckets` for about 100 identifiers per bucket at the target size (about 58 identifiers per INDIVIDUAL with the default descriptors): the default 2^24 suits ~30M INDIVIDUALs; 2^31 suits the ~173B identifiers of 250B triples. The count can't change once a namespace has data, since lookups would read the wrong buckets.
 
-Every new identifier rewrites its whole bucket, so buckets are where this model pays in write amplification: at ~177 entries a bucket is ~8 KB, against ~260 B for a triple record. Load throughput is bounded by how fast the devices absorb that. More buckets mean smaller rewrites at the cost of more records. `-id-index=false` skips the set entirely, for loads that don't need lookups by identifier.
+Every new identifier rewrites its whole bucket, so buckets are where this model pays in write amplification: at ~177 entries a bucket is ~8 KB, against ~260 B for a triple record. At 250B triples that is about 330 TB of device writes per replica (about 650 TB at RF 2) to build about 62 TB of data, and load throughput is bounded by how fast the devices and defrag absorb it. More buckets mean smaller rewrites at the cost of more records. `-id-index=false` skips the set entirely, for loads that don't need lookups by identifier; it leaves the `lpg_id_index_off` record, and lookups scan while it exists.
+
+An identifier shared by more than 1,000 vertices (a placeholder value, a common literal) keeps only 1,000 of them in its bucket, so the bucket can't grow to the record limit; lookups of such an identifier scan instead, with the test filtered on the server. See [the design notes](lpg/README.md#finding-a-vertex-by-identifier).
+
+### Rewriting and Counts
+
+Every write merges: an edge or identifier written again keeps the earlier `created` and the later `last_seen`, edge properties are merged, and a vertex keeps the first type it was given. `edge_count` and `indiv_links` are computed in the same record operation from the entries before and after it, so they are exact however often data is rewritten, and sharing caps hold. Re-running a load, overlapping loads, and the batch writer's retries (3 tries a batch) leave the same data as one clean run. The two sides of an edge are separate writes: a load that stops between them leaves the edge on one side, and re-running it completes the edge. See [Writes](lpg/README.md#writes) for the one rare race left.
+
+Namespaces written before the layout version existed have inexact counts and can't be written to by this version: reload them into an empty namespace ([migrating](lpg/README.md#migrating-from-the-first-layout)).
 
 ### Sharing
 
@@ -370,7 +380,7 @@ Every operation on one edge or one page stays flat from 1K to 10M edges; p99s st
 | `g.V().hasLabel('HOUSEHOLD')` | The type index if the namespace has one, otherwise a scan with the type filtered on the server |
 | `g.V()`, `g.E()` | A scan of every vertex |
 
-Vertex labels are entity types and vertex ids are entity ids. Identifiers are multi-properties keyed by identifier type, each with `created`, `last_seen` and `decay` meta-properties; vertices also have `created`, `individual_links` and, for hubs, `hub`. Edge labels are predicates, edge ids are `<out id>|<label>|<in id>`, and edges have `created`, `last_seen` and any properties they were loaded with. Writes are not supported: load with `generate -model lpg` or `load -model lpg`. Hashed data is shown as stored.
+Vertex labels are entity types and vertex ids are entity ids. Identifiers are multi-properties keyed by identifier type, each with `created`, `last_seen` and `decay` meta-properties; vertices also have `created`, `individual_links` and, for hubs, `hub`. Edge labels are predicates, edge ids are `<out id>|<label>|<in id>` (a `|` or `\` inside a part is escaped with `\`), and edges have `created`, `last_seen` and any properties they were loaded with. Writes are not supported: load with `generate -model lpg` or `load -model lpg`. Hashed data is shown as stored, and queried as stored: on data generated with `-hash-parts` covering IDs or identifiers, give `g.V(...)` and `has(type, value)` the hashed values (`lpgquery` hashes readable ones for you). Vertices are cached for `aerospike.cache.ttl.ms` (10 s; 0 turns it off), up to `aerospike.cache.size` (100,000), in `gremlin/conf/aerolpg.properties`.
 
 #### AGS-Style Optimizations
 
@@ -380,14 +390,14 @@ The provider follows what Aerospike Graph (AGS) does to read less, through two t
 |---------|---------|--------------|----------|
 | Supernode designation | `has('~supernode')`, `hasNot('~supernode')` | A hidden property present only on hubs, as AGS's `~supernode`, to keep or skip them | |
 | Supernode warnings | | Logs a traversal reading a hub's buckets: the first, then 1 in 10 (`aerospike.supernode.warning=false` turns it off) | |
-| Edge filter pushdown | `inE('IS_PART_OF').has('created', gt(t))` (eq, gt, gte, lt, lte) | Each hub bucket returns only the edges in the range, selected on the server by a map value range; with a lower bound, the newest levels are read first, where recent edges are | 10 most recent of 10M edges: 8 ms, against 2.7 s filtering in Java. All 11,000 of them: 1.0 s against 4.6 s |
+| Edge filter pushdown | `inE('IS_PART_OF').has('created', gt(t))` (eq, gt, gte, lt, lte) | Each hub bucket returns only the edges in the range, selected on the server by a map value range; with a lower bound, the newest levels are read first, where recent edges are | 10 of the 10M edges created after *t*: 8 ms, against 2.7 s filtering in Java. All 11,000 of them: 1.0 s against 4.6 s |
 | Local counting | `outE()/inE()/both()...count()` | Counted on the server, from inline maps and each bucket's count, without reading the edges | 10M-edge hub: 0.5 s; 33K-edge hub: 21 ms |
 | Edge bin omission | `g.V(id).elementMap()`, `values(...)` | Vertices are read without their edge bins when nothing in the traversal reads edges | |
 | Counting without bins | `g.V().count()`, `g.V().hasLabel(x).count()` | The scan returns keys only | `g.V().count()` over 12.3M: 3.4 s, from 10.5 s |
-| Label index | `g.V().hasLabel(x)` | Uses `idx_vertices_type` when it exists (`generate -label-index`) | All 159,958 HOUSEHOLDs counted: 87 ms, from 1.8 s by scan; 10 of them: 11 ms, from 76 ms |
+| Label index | `g.V().hasLabel(x)` | Uses `idx_vertices_type` once it is built (state `RW`) on every node (`generate -label-index`) | All 159,958 HOUSEHOLDs counted: 87 ms, from 1.8 s by scan; 10 of them: 11 ms, from 76 ms |
 | Edge properties | `elementMap()` on edges | Any properties an edge was loaded with, besides `created` and `last_seen` | |
 
-The pushed-down range only narrows what hub buckets return; the `has()` steps stay in the traversal and still filter every edge, so results are the same with or without it. Counts without labels add each bucket's `edge_count`, which counts an edge written to the same bucket twice twice; counts with labels size the stored maps and are exact.
+The pushed-down range only narrows what hub buckets return; the `has()` steps stay in the traversal and still filter every edge, so results are the same with or without it. Counts with labels size the stored maps; counts without add each bucket's `edge_count`. Both are exact.
 
 Run it with Java 17 (Gremlin Server 3.7's Groovy doesn't run on newer JDKs) and Maven:
 
@@ -395,6 +405,8 @@ Run it with Java 17 (Gremlin Server 3.7's Groovy doesn't run on newer JDKs) and 
 # set aerospike.hosts and aerospike.namespace in gremlin/conf/aerolpg.properties first
 JAVA_HOME=/path/to/jdk-17 gremlin/run.sh          # builds on first run; serves ws://localhost:8182/gremlin
 ```
+
+The server listens on localhost only. It runs Groovy scripts from any client that reaches it, with the JVM's privileges and the Aerospike credentials in its configuration, and it has no authentication: before setting `host` in `gremlin/conf/gremlin-server.yaml` to another interface, turn on its `authentication` and `ssl` sections (the file shows how), or put it behind something that does.
 
 In G.V(), add a new connection of the generic Gremlin Server (Apache TinkerPop) kind, not the Aerospike Graph one, with host `localhost`, port `8182`, no SSL, and traversal source `g`. Queries to try, on data generated with `-hubs` and the `lpgbench -run demo` hub:
 
@@ -453,13 +465,13 @@ go build -o load ./cmd/load
 | `-readers` | CPU count | Concurrent file readers |
 | `-workers` | `8` | Concurrent writer goroutines |
 | `-batch` | `1024` | Batch write size |
-| `-props-mode` | `replace` | When a triple already exists: `replace` its props, or `merge` the new props into them |
+| `-props-mode` | `replace` | When a triple already exists: `replace` its props, or `merge` the new props into them. `-model triples` only: `-model lpg` always merges, and rejects the flag |
 | `-reject-file` | | Write every rejected record, with its file, byte offset and reason, to this file |
 | `-max-errors` | `1000` | Stop after this many rejected records; `0` = no limit |
 | `-dry-run` | off | Check each file's columns and print the first triples (hashed, if hashing), without connecting or writing |
 | `-rebuild-predicates` | off | Scan every triple and record its predicate in the `meta` set, then exit. Run once for data written before predicates were recorded (`-rebuild-entities` in the generator does this too) |
 | `-hash-type`, `-hash-parts` | `no-hash`, `identifiers` | Hash loaded content as the generator does, so it links with hashed generated data. See [Loaded and Generated Data](#loaded-and-generated-data) |
-| `-model` | `triples` | `triples`, or `lpg` to load into the [vertex model](#vertex-model-lpg): `IS_TYPE` and `HAS_IDENTIFIER` triples and N-Triples literals become vertex properties, other triples become edges keeping all their `-props_columns` |
+| `-model` | `triples` | `triples`, or `lpg` to load into the [vertex model](#vertex-model-lpg): `IS_TYPE`, `rdf:type` and `HAS_IDENTIFIER` triples and N-Triples literals become vertex types and properties (literals keep a language tag as `text@lang` but not their datatype), other triples become edges keeping all their `-props_columns` |
 | `-id-buckets` | `16777216`, or the namespace's | `-model lpg`: identifier lookup buckets, fixed by the first load into a namespace |
 | `-client-index`, `-client-count` | `0`, `1` | Split the input between loaders on multiple hosts |
 | `-version` | off | Print the build version and exit |

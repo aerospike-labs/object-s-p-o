@@ -46,16 +46,26 @@ final class AeroVertex implements Vertex {
 
     final AeroGraph graph;
     final String id;
-    private Record record;
-    private boolean withEdges;
-    long loadedAt;
+    /** Replaced whole, never changed, so threads sharing a cached vertex see a consistent read. */
+    private volatile Loaded loaded;
+
+    /** A read of the vertex's record, with or without its edge bins, and when it was made. */
+    private static final class Loaded {
+        final Record record;
+        final boolean withEdges;
+        final long at;
+
+        Loaded(Record record, boolean withEdges) {
+            this.record = record;
+            this.withEdges = withEdges;
+            this.at = System.currentTimeMillis();
+        }
+    }
 
     AeroVertex(AeroGraph graph, String id, Record record, boolean withEdges) {
         this.graph = graph;
         this.id = id;
-        this.record = record;
-        this.withEdges = withEdges;
-        this.loadedAt = System.currentTimeMillis();
+        this.loaded = record == null ? null : new Loaded(record, withEdges);
     }
 
     /** A reference to a vertex by id, read when first needed. */
@@ -64,29 +74,33 @@ final class AeroVertex implements Vertex {
     }
 
     boolean hasEdges() {
-        return record != null && withEdges;
+        Loaded l = loaded;
+        return l != null && l.withEdges;
+    }
+
+    long loadedAt() {
+        Loaded l = loaded;
+        return l == null ? 0 : l.at;
     }
 
     private Record record() {
-        if (record == null) {
-            load(false);
-        }
-        return record;
+        Loaded l = loaded;
+        return l != null ? l.record : load(false).record;
     }
 
     /** The record with its inline edge bins, read again if it was read without them. */
     private Record recordWithEdges() {
-        if (!hasEdges()) {
-            load(true);
-        }
-        return record;
+        Loaded l = loaded;
+        return l != null && l.withEdges ? l.record : load(true).record;
     }
 
-    private void load(boolean edges) {
+    private Loaded load(boolean edges) {
         AeroVertex v = graph.loadVertex(id, edges);
-        record = v != null ? v.record : new Record(Collections.emptyMap(), 0, 0);
-        withEdges = v == null || v.withEdges;
-        loadedAt = System.currentTimeMillis();
+        Loaded l = v != null && v.loaded != null
+                ? new Loaded(v.loaded.record, v.loaded.withEdges)
+                : new Loaded(new Record(Collections.emptyMap(), 0, 0), true);
+        loaded = l;
+        return l;
     }
 
     @Override

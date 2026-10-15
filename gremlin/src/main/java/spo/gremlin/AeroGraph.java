@@ -64,9 +64,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Vertex ids are the entity ids ({@code INDIVIDUAL:123}), labels are the entity types, and
  * identifiers are multi-properties keyed by identifier type, with {@code created},
  * {@code last_seen} and {@code decay} meta-properties. Edge ids are
- * {@code <out id>|<label>|<in id>}.
+ * {@code <out id>|<label>|<in id>}, with {@code |} and {@code \} in the parts escaped by {@code \}.
  */
-@Graph.OptIn(Graph.OptIn.SUITE_STRUCTURE_STANDARD)
 public final class AeroGraph implements Graph {
 
     static {
@@ -94,6 +93,11 @@ public final class AeroGraph implements Graph {
     static final String BIN_BUCKET_EDGES = "edges";
     static final String BIN_ID_BUCKET = "vertices_by_tag";
     static final String LABEL_INDEX = "idx_vertices_type";
+    static final String CONFIG = "lpg_config";
+    static final String FORMAT_RECORD = "lpg_format";
+    static final String FORMAT = "2";
+    static final String ID_INDEX_OFF = "lpg_id_index_off";
+    static final int MAX_IDENTIFIER_SHARE = 1000;
     static final int HUB_BASE_BUCKETS = 16;
     static final int HUB_BUCKET_EDGES = 256;
     static final int HUB_READ_CHUNK = 64;
@@ -118,7 +122,9 @@ public final class AeroGraph implements Graph {
     private final boolean supernodeWarnings;
     private final AtomicLong supernodeReads = new AtomicLong();
     private final Features features = new AeroFeatures();
-    private final VertexCache cache = new VertexCache(100_000);
+    private final VertexCache cache;
+    private volatile long idIndexCheckedAt;
+    private volatile boolean idIndexComplete;
 
     private AeroGraph(Configuration configuration) {
         this.configuration = configuration;
@@ -135,18 +141,25 @@ public final class AeroGraph implements Graph {
         this.client = new AerospikeClient(cp, hosts);
         this.namespace = configuration.getString("aerospike.namespace", "test");
         this.supernodeWarnings = configuration.getBoolean("aerospike.supernode.warning", true);
+        this.cache = new VertexCache(configuration.getInt("aerospike.cache.size", 100_000),
+                configuration.getLong("aerospike.cache.ttl.ms", 10_000));
 
         this.readPolicy = new Policy();
         this.batchPolicy = new BatchPolicy();
         this.queryPolicy = new QueryPolicy();
         this.queryPolicy.includeBinData = true;
 
-        Record config = client.get(readPolicy, new Key(namespace, META_SET, "lpg_config"), "id_buckets");
+        Record config = client.get(readPolicy, new Key(namespace, META_SET, CONFIG), "id_buckets");
         if (config == null || config.getString("id_buckets") == null) {
             client.close();
             throw new IllegalStateException("namespace " + namespace + " has no lpg data (meta record lpg_config is missing)");
         }
         this.idBuckets = Long.parseUnsignedLong(config.getString("id_buckets"));
+        Record format = client.get(readPolicy, new Key(namespace, META_SET, FORMAT_RECORD), "format");
+        if (format == null || !FORMAT.equals(format.getString("format"))) {
+            log.warn("Namespace {} was written in an older lpg format: its edge counts and hub edges may be inexact until it is reloaded",
+                    namespace);
+        }
         this.labelIndexed = hasLabelIndex();
         log.info("Aerospike namespace {}: {} identifier buckets, vertex type index {}", namespace, idBuckets,
                 labelIndexed ? "present" : "absent (hasLabel scans)");
@@ -164,12 +177,29 @@ public final class AeroGraph implements Graph {
         return open(c);
     }
 
+    /**
+     * Whether the type index is built and readable on every node: a query on an index still being
+     * built returns only part of the vertices.
+     */
     private boolean hasLabelIndex() {
         String cmd = "sindex-list:ns=" + namespace;
-        for (Node node : client.getNodes()) {
-            String info = Info.request(null, node, cmd);
-            if (info != null && info.contains("indexname=" + LABEL_INDEX + ":")) {
-                return true;
+        Node[] nodes = client.getNodes();
+        for (Node node : nodes) {
+            if (!indexReadable(Info.request(null, node, cmd), LABEL_INDEX)) {
+                return false;
+            }
+        }
+        return nodes.length > 0;
+    }
+
+    /** Whether a sindex-list response lists the named index in state RW, as lpg.IndexReadable. */
+    static boolean indexReadable(String sindexList, String name) {
+        if (sindexList == null) {
+            return false;
+        }
+        for (String entry : sindexList.split(";")) {
+            if (entry.contains("indexname=" + name + ":")) {
+                return entry.contains("state=RW");
             }
         }
         return false;
@@ -245,6 +275,11 @@ public final class AeroGraph implements Graph {
      * keys come back, for counting. Closing the iterator stops the scan.
      */
     CloseableIterator<AeroVertex> scanVertices(String type, ScanBins bins) {
+        return scanVertices(type, bins, null);
+    }
+
+    /** As {@link #scanVertices(String, ScanBins)}, keeping only vertices that match filter as well. */
+    CloseableIterator<AeroVertex> scanVertices(String type, ScanBins bins, Exp filter) {
         Statement stmt = new Statement();
         stmt.setNamespace(namespace);
         stmt.setSetName(VERTEX_SET);
@@ -252,7 +287,11 @@ public final class AeroGraph implements Graph {
         if (type != null && labelIndexed) {
             stmt.setFilter(Filter.equal(BIN_TYPE, type));
         } else if (type != null) {
-            qp.filterExp = Exp.build(Exp.eq(Exp.stringBin(BIN_TYPE), Exp.val(type)));
+            Exp byType = Exp.eq(Exp.stringBin(BIN_TYPE), Exp.val(type));
+            filter = filter == null ? byType : Exp.and(byType, filter);
+        }
+        if (filter != null) {
+            qp.filterExp = Exp.build(filter);
         }
         switch (bins) {
             case NONE:
@@ -299,30 +338,37 @@ public final class AeroGraph implements Graph {
 
     /**
      * Finds the vertices holding an identifier through the identifier index: one read of the
-     * identifier's bucket, then a batch read confirming each candidate holds it.
+     * identifier's bucket, then a batch read confirming each candidate holds it. When the index
+     * can't answer, because a writer skipped it or the identifier is held by more vertices than
+     * it keeps, the vertices are found by a scan filtered on the server instead.
      */
-    List<AeroVertex> lookupIdentifier(String idType, String value, boolean withEdges) {
-        byte[] h = sha256(idType + "\0" + value);
-        ByteBuffer bb = ByteBuffer.wrap(h);
-        long bucket = Long.remainderUnsigned(bb.getLong(0), idBuckets);
-        long tag = bb.getLong(8);
+    Iterator<AeroVertex> lookupIdentifier(String idType, String value, boolean withEdges) {
+        if (!identifierIndexComplete()) {
+            return scanIdentifier(idType, value, withEdges);
+        }
+        long[] slot = identifierSlot(idType, value, idBuckets);
+        long bucket = slot[0];
+        long tag = slot[1];
         Record rec;
         try {
             rec = client.operate(null, new Key(namespace, ID_INDEX_SET, bucket),
                     MapOperation.getByKey(BIN_ID_BUCKET, Value.get(tag), MapReturnType.VALUE));
         } catch (AerospikeException e) {
             if (e.getResultCode() == ResultCode.KEY_NOT_FOUND_ERROR) {
-                return Collections.emptyList();
+                return Collections.emptyIterator();
             }
             throw e;
         }
         if (rec == null) {
-            return Collections.emptyList();
+            return Collections.emptyIterator();
         }
         // {vertex id: created} of the identifier's tag
         List<String> ids = new ArrayList<>();
         for (Map.Entry<?, ?> e : entries(rec.getValue(BIN_ID_BUCKET))) {
             ids.add(e.getKey().toString());
+        }
+        if (ids.size() >= MAX_IDENTIFIER_SHARE) {
+            return scanIdentifier(idType, value, withEdges);
         }
         List<AeroVertex> found = new ArrayList<>();
         for (AeroVertex v : loadVertices(ids, withEdges)) {
@@ -330,7 +376,37 @@ public final class AeroGraph implements Graph {
                 found.add(v);
             }
         }
-        return found;
+        return found.iterator();
+    }
+
+    /** The vertices holding an identifier, from a scan of all vertices filtered on the server. */
+    private Iterator<AeroVertex> scanIdentifier(String idType, String value, boolean withEdges) {
+        Exp ids = Exp.mapBin(BIN_IDS);
+        Exp holds = Exp.cond(
+                Exp.and(Exp.binExists(BIN_IDS), MapExp.getByKey(MapReturnType.EXISTS, Exp.Type.BOOL, Exp.val(idType), ids)),
+                MapExp.getByKey(MapReturnType.EXISTS, Exp.Type.BOOL, Exp.val(value),
+                        MapExp.getByKey(MapReturnType.VALUE, Exp.Type.MAP, Exp.val(idType), ids)),
+                Exp.val(false));
+        return scanVertices(null, withEdges ? ScanBins.ALL : ScanBins.NO_EDGES, holds);
+    }
+
+    /**
+     * Whether the identifier index holds every identifier: false once any writer has run with
+     * -id-index=false, which leaves a meta record saying so. Checked at most once a cache TTL.
+     */
+    boolean identifierIndexComplete() {
+        long now = System.currentTimeMillis();
+        if (now - idIndexCheckedAt > cache.ttlMillis) {
+            idIndexComplete = client.get(readPolicy, new Key(namespace, META_SET, ID_INDEX_OFF)) == null;
+            idIndexCheckedAt = now;
+        }
+        return idIndexComplete;
+    }
+
+    /** The identifier index bucket and tag of an identifier, as lpg.Store.identifierSlot. */
+    static long[] identifierSlot(String idType, String value, long buckets) {
+        ByteBuffer bb = ByteBuffer.wrap(sha256(idType + "\0" + value));
+        return new long[]{Long.remainderUnsigned(bb.getLong(0), buckets), bb.getLong(8)};
     }
 
     // ------------------------------------------------------------------- edges
@@ -342,21 +418,54 @@ public final class AeroGraph implements Graph {
         }
         List<Edge> found = new ArrayList<>();
         for (Object o : edgeIds) {
-            String id = o instanceof Edge ? ((Edge) o).id().toString() : o.toString();
-            int first = id.indexOf('|');
-            int last = id.lastIndexOf('|');
-            if (first < 0 || first == last) {
+            String[] parts = parseEdgeId(o instanceof Edge ? ((Edge) o).id().toString() : o.toString());
+            if (parts == null) {
                 continue;
             }
-            String out = id.substring(0, first);
-            String label = id.substring(first + 1, last);
-            String in = id.substring(last + 1);
-            Object tuple = edgeTuple(out, true, label, in);
+            Object tuple = edgeTuple(parts[0], true, parts[1], parts[2]);
             if (tuple != null) {
-                found.add(AeroEdge.of(this, out, label, in, tuple));
+                found.add(AeroEdge.of(this, parts[0], parts[1], parts[2], tuple));
             }
         }
         return found.iterator();
+    }
+
+    /** The id of edge out -label-> in: the three parts joined by |, with | and \ in them escaped. */
+    static String edgeId(String out, String label, String in) {
+        return escape(out) + "|" + escape(label) + "|" + escape(in);
+    }
+
+    private static String escape(String s) {
+        if (s.indexOf('|') < 0 && s.indexOf('\\') < 0) {
+            return s;
+        }
+        return s.replace("\\", "\\\\").replace("|", "\\|");
+    }
+
+    /** Splits an edge id into its out vertex, label and in vertex, or returns null if it isn't one. */
+    static String[] parseEdgeId(String id) {
+        String[] parts = new String[3];
+        int n = 0;
+        StringBuilder cur = new StringBuilder();
+        for (int i = 0; i < id.length(); i++) {
+            char c = id.charAt(i);
+            if (c == '\\' && i + 1 < id.length()) {
+                cur.append(id.charAt(++i));
+            } else if (c == '|') {
+                if (n == 2) {
+                    return null;
+                }
+                parts[n++] = cur.toString();
+                cur.setLength(0);
+            } else {
+                cur.append(c);
+            }
+        }
+        if (n != 2) {
+            return null;
+        }
+        parts[2] = cur.toString();
+        return parts;
     }
 
     /** Every edge, from a scan of vertices' outgoing edges, inline and bucketed. */
@@ -450,7 +559,7 @@ public final class AeroGraph implements Graph {
      * Counts a vertex's edges in a direction with the given labels (all when null) without
      * reading them: its inline edge maps, plus for a hub the counts of its edge buckets computed
      * on the server, as AGS counts adjacency locally. Without labels a bucket's count is its
-     * edge_count, which counts an edge written to the same bucket twice twice.
+     * edge_count, which the writer keeps exact.
      */
     long degree(AeroVertex v, Direction direction, Set<String> labels) {
         long n = 0;
@@ -655,13 +764,16 @@ public final class AeroGraph implements Graph {
     }
 
     /**
-     * A small LRU of vertices read in the last 10 seconds, so edges' endpoints aren't read one at
-     * a time again. A vertex read without its edges serves only reads that don't need them.
+     * A small LRU of vertices read in the last aerospike.cache.ttl.ms (10 seconds by default), so
+     * edges' endpoints aren't read one at a time again; a TTL of 0 turns it off. A vertex read
+     * without its edges serves only reads that don't need them.
      */
     private static final class VertexCache {
         private final Map<String, AeroVertex> map;
+        final long ttlMillis;
 
-        VertexCache(int size) {
+        VertexCache(int size, long ttlMillis) {
+            this.ttlMillis = ttlMillis;
             this.map = Collections.synchronizedMap(new LinkedHashMap<String, AeroVertex>(1024, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, AeroVertex> eldest) {
@@ -675,7 +787,7 @@ public final class AeroGraph implements Graph {
             if (v == null || (withEdges && !v.hasEdges())) {
                 return null;
             }
-            if (System.currentTimeMillis() - v.loadedAt > 10_000) {
+            if (System.currentTimeMillis() - v.loadedAt() > ttlMillis) {
                 map.remove(id);
                 return null;
             }
@@ -683,6 +795,9 @@ public final class AeroGraph implements Graph {
         }
 
         void put(AeroVertex v) {
+            if (ttlMillis <= 0) {
+                return;
+            }
             AeroVertex prev = map.get(v.id);
             if (prev == null || v.hasEdges() || !prev.hasEdges()) {
                 map.put(v.id, v);

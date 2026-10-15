@@ -129,8 +129,7 @@ const hubReadChunk = 64
 // HubEdges returns up to limit (0 = all) of a hub's bucketed edges in dir
 // whose predicate is in preds (all when empty), reading its edge buckets a
 // chunk at a time and stopping once it has enough. The hub's inline edges
-// are on its Vertex. An edge written again after the hub moved up a level
-// can appear twice; the newest copy comes last.
+// are on its Vertex.
 func (s *Store) HubEdges(v *Vertex, dir Direction, preds map[string]bool, limit int) ([]EdgeRef, error) {
 	id := v.ID
 	var out []EdgeRef
@@ -217,7 +216,7 @@ func (s *Store) hasEdge(id string, outgoing bool, pred, nbr string) (bool, error
 		return false, err
 	}
 	rec, aerr := s.gs.Client.Operate(nil, key,
-		aero.MapGetByKeyOp(bin, aero.NewStringValue(nbr), aero.MapReturnType.EXISTS, aero.CtxMapKey(aero.NewStringValue(pred))),
+		aero.ExpReadOp("e", hasEdgeExp(bin, pred, nbr), aero.ExpReadFlagEvalNoFail),
 		aero.GetBinOp(levelBin(outgoing)))
 	if aerr != nil {
 		if aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
@@ -225,7 +224,7 @@ func (s *Store) hasEdge(id string, outgoing bool, pred, nbr string) (bool, error
 		}
 		return false, aerr
 	}
-	if found, _ := rec.Bins[bin].(bool); found {
+	if found, _ := rec.Bins["e"].(bool); found {
 		return true, nil
 	}
 	level, hub := rec.Bins[levelBin(outgoing)].(int)
@@ -239,7 +238,7 @@ func (s *Store) hasEdge(id string, outgoing bool, pred, nbr string) (bool, error
 		}
 	}
 	recs, aerr := s.gs.Client.BatchGetOperate(s.gs.BatchPolicy, keys,
-		aero.MapGetByKeyOp(binBucketE, aero.NewStringValue(nbr), aero.MapReturnType.EXISTS, aero.CtxMapKey(aero.NewStringValue(pred))))
+		aero.ExpReadOp("e", hasEdgeExp(binBucketE, pred, nbr), aero.ExpReadFlagEvalNoFail))
 	if aerr != nil {
 		return false, aerr
 	}
@@ -247,16 +246,24 @@ func (s *Store) hasEdge(id string, outgoing bool, pred, nbr string) (bool, error
 		if r == nil {
 			continue
 		}
-		if found, _ := r.Bins[binBucketE].(bool); found {
+		if found, _ := r.Bins["e"].(bool); found {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
+// hasEdgeExp is true when the {predicate: {neighbor: tuple}} map bin holds
+// the edge, and false, not an error, when the bin or predicate is absent.
+func hasEdgeExp(bin, pred, nbr string) *aero.Expression {
+	return aero.ExpCond(hasKey(bin, pred),
+		aero.ExpMapGetByKey(aero.MapReturnType.EXISTS, aero.ExpTypeBOOL, aero.ExpStringVal(nbr), aero.ExpMapBin(bin), strCtx(pred)),
+		aero.ExpBoolVal(false))
+}
+
 // Degree returns the number of edges of a vertex in dir: its inline edges
 // plus, for a hub, the edge counts of all its buckets. Reads every bucket of
-// a hub, so it grows with the hub; edges written twice count twice.
+// a hub, so it grows with the hub.
 func (s *Store) Degree(id string, dir Direction) (int, error) {
 	v, err := s.GetVertex(id)
 	if err != nil || v == nil {
@@ -298,10 +305,26 @@ func (s *Store) Degree(id string, dir Direction) (int, error) {
 	return n, nil
 }
 
+// IdentifierIndexComplete reports whether the identifier lookup set holds
+// every identifier: false once any writer has run without it.
+func (s *Store) IdentifierIndexComplete() (bool, error) {
+	off, err := s.gs.GetMetaString(IDIndexOffName, "off")
+	return off == "", err
+}
+
 // LookupIdentifier returns the IDs of the vertices holding an identifier, by
 // its type and value as stored. One read of the identifier's bucket finds the
-// candidates; a batch read of them confirms each holds the identifier.
+// candidates; a batch read of them confirms each holds the identifier. An
+// identifier the lookup set can't answer for, because it is over-shared or
+// the set is incomplete, is found by a scan filtered on the server.
 func (s *Store) LookupIdentifier(idType, value string) ([]string, error) {
+	complete, err := s.IdentifierIndexComplete()
+	if err != nil {
+		return nil, err
+	}
+	if !complete {
+		return s.scanIdentifier(idType, value)
+	}
 	bucket, tag := s.identifierSlot(idType, value)
 	key, err := s.bucketKey(bucket)
 	if err != nil {
@@ -318,6 +341,9 @@ func (s *Store) LookupIdentifier(idType, value string) ([]string, error) {
 	candidates := pairs(rec.Bins[binBucket])
 	if len(candidates) == 0 {
 		return nil, nil
+	}
+	if len(candidates) >= MaxIdentifierShare {
+		return s.scanIdentifier(idType, value)
 	}
 	ids := make([]string, 0, len(candidates))
 	for _, c := range candidates {
@@ -351,6 +377,32 @@ func (s *Store) LookupIdentifier(idType, value string) ([]string, error) {
 		}
 	}
 	return found, nil
+}
+
+// scanIdentifier returns the IDs of the vertices holding an identifier, from
+// a scan of all vertices filtered on the server.
+func (s *Store) scanIdentifier(idType, value string) ([]string, error) {
+	qp := aero.NewQueryPolicy()
+	qp.FilterExpression = aero.ExpCond(hasKey(binIDs, idType),
+		aero.ExpMapGetByKey(aero.MapReturnType.EXISTS, aero.ExpTypeBOOL, aero.ExpStringVal(value), aero.ExpMapBin(binIDs), strCtx(idType)),
+		aero.ExpBoolVal(false))
+	qp.IncludeBinData = false
+	rs, aerr := s.gs.Client.Query(qp, aero.NewStatement(s.gs.Namespace, VertexSet))
+	if aerr != nil {
+		return nil, aerr
+	}
+	defer rs.Close()
+	var ids []string
+	for r := range rs.Results() {
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		if id, ok := r.Record.Key.Value().GetObject().(string); ok {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // Direction selects which edges a traversal follows.
@@ -607,19 +659,33 @@ func toInt64(v interface{}) int64 {
 	return 0
 }
 
-// LabelIndexed reports whether the namespace has the vertex type index.
+// LabelIndexed reports whether the namespace has the vertex type index, built
+// and readable on every node: a query on an index still being built returns
+// only part of the vertices.
 func (s *Store) LabelIndexed() (bool, error) {
 	cmd := "sindex-list:ns=" + s.gs.Namespace
-	for _, node := range s.gs.Client.GetNodes() {
+	nodes := s.gs.Client.GetNodes()
+	for _, node := range nodes {
 		info, err := node.RequestInfo(aero.NewInfoPolicy(), cmd)
 		if err != nil {
 			return false, err
 		}
-		if strings.Contains(info[cmd], "indexname="+LabelIndexName+":") {
-			return true, nil
+		if !IndexReadable(info[cmd], LabelIndexName) {
+			return false, nil
 		}
 	}
-	return false, nil
+	return len(nodes) > 0, nil
+}
+
+// IndexReadable reports whether a sindex-list response lists the named
+// index in state RW.
+func IndexReadable(sindexList, name string) bool {
+	for _, entry := range strings.Split(sindexList, ";") {
+		if strings.Contains(entry, "indexname="+name+":") {
+			return strings.Contains(entry, "state=RW")
+		}
+	}
+	return false
 }
 
 // VerticesByType returns the IDs of up to about limit (0 = all) vertices of a

@@ -224,7 +224,9 @@ func main() {
 			log.Fatal(err)
 		}
 		ls.SetMaxInlineEdges(*maxInlineEdges)
-		ls.IndexIdentifiers = *idIndex
+		if err := ls.SetIndexIdentifiers(*idIndex); err != nil {
+			log.Fatal(err)
+		}
 		if *labelIndex {
 			if err := ls.CreateLabelIndex(); err != nil {
 				log.Fatalf("failed to create the vertex type index: %v", err)
@@ -232,7 +234,7 @@ func main() {
 		}
 		mainSet = lpg.VertexSet
 		fmt.Printf("Model: lpg (%d identifier buckets, %d inline edges per record, identifier index %v)\n\n",
-			ls.IDBuckets, ls.MaxInlineEdges, ls.IndexIdentifiers)
+			ls.IDBuckets, ls.MaxInlineEdges, ls.IndexesIdentifiers())
 	} else if err := gs.CreateIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
 	}

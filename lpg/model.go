@@ -60,14 +60,18 @@ type Identifier struct {
 }
 
 // Mutation is what to add to one vertex. Everything in it is merged into the
-// stored vertex: maps gain entries and Links is added to the stored count.
+// stored vertex: maps gain entries, and an edge or identifier already stored
+// keeps the earlier created and the later last_seen of the two.
 type Mutation struct {
 	ID          string
-	Type        string // set only when the vertex is created
-	Created     int64
+	Type        string                           // kept only if the vertex has no type yet
+	Created     int64                            // the earlier of this and the stored one is kept
 	Identifiers map[string]map[string]Identifier // type -> value -> props
 	Out, In     map[string]map[string]Edge       // predicate -> neighbor -> props
-	Links       int                              // INDIVIDUAL links added
+	// LinkPreds are the predicates of In whose edges count as INDIVIDUAL
+	// links, for sharing caps. The stored count is the number of distinct
+	// such edges, so writing an edge again doesn't count it again.
+	LinkPreds map[string]bool
 }
 
 func (m *Mutation) edgeCount() int {
@@ -83,8 +87,11 @@ func (m *Mutation) edgeCount() int {
 
 // merge adds o, a mutation of the same vertex, to m.
 func (m *Mutation) merge(o *Mutation) {
-	if o.Type != "" {
-		m.Type, m.Created = o.Type, o.Created
+	if m.Type == "" {
+		m.Type = o.Type
+	}
+	if o.Created != 0 && (m.Created == 0 || o.Created < m.Created) {
+		m.Created = o.Created
 	}
 	for t, vals := range o.Identifiers {
 		for v, id := range vals {
@@ -93,7 +100,27 @@ func (m *Mutation) merge(o *Mutation) {
 	}
 	m.Out = mergeEdges(m.Out, o.Out)
 	m.In = mergeEdges(m.In, o.In)
-	m.Links += o.Links
+	for p := range o.LinkPreds {
+		m.addLinkPred(p)
+	}
+}
+
+func (m *Mutation) addLinkPred(pred string) {
+	if m.LinkPreds == nil {
+		m.LinkPreds = make(map[string]bool)
+	}
+	m.LinkPreds[pred] = true
+}
+
+// linkPreds returns the predicates of In that count as INDIVIDUAL links.
+func (m *Mutation) linkPreds() []string {
+	var out []string
+	for p := range m.In {
+		if m.LinkPreds[p] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func mergeEdges(dst, src map[string]map[string]Edge) map[string]map[string]Edge {
@@ -112,8 +139,38 @@ func addEdge(m map[string]map[string]Edge, pred, nbr string, e Edge) map[string]
 	if m[pred] == nil {
 		m[pred] = make(map[string]Edge)
 	}
+	if prev, ok := m[pred][nbr]; ok {
+		e = prev.mergedWith(e)
+	}
 	m[pred][nbr] = e
 	return m
+}
+
+// mergedWith returns e and o merged as the store merges them: the earlier
+// created and the later last_seen, ignoring zeros, and both sets of props,
+// o's winning.
+func (e Edge) mergedWith(o Edge) Edge {
+	e.Created = earliest(e.Created, o.Created)
+	e.LastSeen = max(e.LastSeen, o.LastSeen)
+	if len(o.Props) > 0 {
+		props := make(map[string]interface{}, len(e.Props)+len(o.Props))
+		for k, v := range e.Props {
+			props[k] = v
+		}
+		for k, v := range o.Props {
+			props[k] = v
+		}
+		e.Props = props
+	}
+	return e
+}
+
+// earliest returns the earlier of two creation times, 0 meaning unknown.
+func earliest(a, b int64) int64 {
+	if a == 0 || (b != 0 && b < a) {
+		return b
+	}
+	return a
 }
 
 func (m *Mutation) addIdentifier(idType, value string, id Identifier) {
@@ -123,13 +180,21 @@ func (m *Mutation) addIdentifier(idType, value string, id Identifier) {
 	if m.Identifiers[idType] == nil {
 		m.Identifiers[idType] = make(map[string]Identifier)
 	}
+	if prev, ok := m.Identifiers[idType][value]; ok {
+		id.Created = earliest(prev.Created, id.Created)
+		id.LastSeen = max(prev.LastSeen, id.LastSeen)
+	}
 	m.Identifiers[idType][value] = id
 }
 
 // Vocabulary names the predicates that FromTriples treats specially, as
 // stored (hashed when predicates are hashed).
 type Vocabulary struct {
-	IsType        string
+	IsType string
+	// RDFType, when set, is a second type predicate, rdf:type in loaded
+	// N-Triples, so RDF classes become vertex types rather than edges to a
+	// class vertex that every instance links to.
+	RDFType       string
 	HasIdentifier string
 	// LinkPredicates are the INDIVIDUAL-to-entity predicates whose objects
 	// count INDIVIDUAL links, for sharing caps.
@@ -139,13 +204,15 @@ type Vocabulary struct {
 // FromTriples turns triples into vertex mutations, one per vertex touched, in
 // order of first appearance:
 //
-//   - IS_TYPE sets the subject's type and creation time.
+//   - IS_TYPE (or RDFType) sets the subject's type, the first one seen, and
+//     its creation time.
 //   - HAS_IDENTIFIER adds the identifier_type and value props to the
 //     subject's identifiers. The identifier node itself (the object) is not
 //     kept: the lookup set finds the vertex by type and value instead.
 //   - A literal (a triple with a datatype prop, as N-Triples literals are
 //     loaded) is a vertex property: the predicate is its key, like an
-//     identifier type, so the identifier lookup set finds it too.
+//     identifier type, so the identifier lookup set finds it too. A
+//     language-tagged literal's value is "<text>@<lang>".
 //   - Any other triple is an edge, added as outgoing on the subject and
 //     incoming on the object, with its created and last_seen props and any
 //     others.
@@ -163,11 +230,15 @@ func FromTriples(triples []*model.Triple, vocab Vocabulary) []*Mutation {
 	}
 
 	for _, t := range triples {
-		switch t.Predicate {
-		case vocab.IsType:
+		isType := t.Predicate == vocab.IsType || (vocab.RDFType != "" && t.Predicate == vocab.RDFType)
+		switch {
+		case isType:
 			m := vertex(t.Subject)
-			m.Type, m.Created = t.Object, propInt(t.Props, "created")
-		case vocab.HasIdentifier:
+			if m.Type == "" {
+				m.Type = t.Object
+			}
+			m.Created = earliest(m.Created, propInt(t.Props, "created"))
+		case t.Predicate == vocab.HasIdentifier:
 			idType, _ := t.Props["identifier_type"].(string)
 			value, ok := t.Props["value"].(string)
 			if !ok {
@@ -180,7 +251,11 @@ func FromTriples(triples []*model.Triple, vocab Vocabulary) []*Mutation {
 			})
 		default:
 			if _, literal := t.Props["datatype"]; literal {
-				vertex(t.Subject).addIdentifier(t.Predicate, t.Object, Identifier{
+				value := t.Object
+				if lang, _ := t.Props["lang"].(string); lang != "" {
+					value += "@" + lang // "chat"@en and "chat"@fr are different values
+				}
+				vertex(t.Subject).addIdentifier(t.Predicate, value, Identifier{
 					Created:  propInt(t.Props, "created"),
 					LastSeen: propInt(t.Props, "last_seen"),
 				})
@@ -200,7 +275,7 @@ func FromTriples(triples []*model.Triple, vocab Vocabulary) []*Mutation {
 			obj := vertex(t.Object)
 			obj.In = addEdge(obj.In, t.Predicate, t.Subject, e)
 			if vocab.LinkPredicates[t.Predicate] {
-				obj.Links++
+				obj.addLinkPred(t.Predicate)
 			}
 		}
 	}

@@ -16,6 +16,7 @@ Command-line flags are documented in the [main README](../README.md#vertex-model
 - [Trade-offs and Limits](#trade-offs-and-limits)
 - [Compared With Aerospike Graph (AGS)](#compared-with-aerospike-graph-ags)
 - [Using It](#using-it)
+  - [Migrating From the First Layout](#migrating-from-the-first-layout)
 - [Code Map](#code-map)
 
 ## Why a Second Model
@@ -35,7 +36,7 @@ The triple model is simple and loads fast: every triple is one small record, key
 
 **The predicate index barely selects.** There are about 10 distinct predicates, so each value of `idx_predicate` points at roughly 25B records. It costs about 7 TB of memory at 250B triples and RF 2 for queries that are effectively scans.
 
-The vertex model keeps the triple model's strengths where it can: the same descriptors and generator, the same hashing, idempotent writes, partitioned multi-host loads. It then fixes the record count.
+The vertex model keeps the triple model's strengths where it can: the same descriptors and generator, the same hashing, idempotent writes (re-running a load changes nothing, counts included), partitioned multi-host loads. It then fixes the record count.
 
 ## How Triples Become Vertices
 
@@ -43,9 +44,9 @@ The generator still produces triples for each INDIVIDUAL; `FromTriples` (in `mod
 
 | Triple | Becomes |
 |---|---|
-| `S IS_TYPE T` | The `type` of vertex S, with its `created` time |
+| `S IS_TYPE T`, or `S rdf:type T` from `load` | The `type` of vertex S, with its `created` time. A vertex keeps the first type it was given |
 | `S HAS_IDENTIFIER x` | An entry in S's `identifiers` map, `{identifier type: {value: [created, last_seen, decay]}}`, plus an entry in the identifier lookup set. The identifier node `x` is not stored |
-| `S P "literal"` (N-Triples) | A vertex property in the same map, keyed by the predicate |
+| `S P "literal"` (N-Triples) | A vertex property in the same map, keyed by the predicate; `"text"@lang` is stored as `text@lang`, and the datatype is dropped |
 | `S P O` (anything else) | An edge: outgoing on S, incoming on O, with its properties |
 
 The same INDIVIDUAL that was 84 records in the triple model is about 14 vertex writes here (the INDIVIDUAL, the entities it creates, and the shared entities it links to). `HOUSEHOLD -[CAN_HAVE_SEVERAL]-> INDIVIDUAL` needs nothing of its own: it is the HOUSEHOLD's incoming `IS_PART_OF` edges.
@@ -77,6 +78,8 @@ identifier_index          key: bucket number (integer)
   vertices_by_tag { <64-bit tag>: { "INDIVIDUAL:100514": created } }
 
 meta / lpg_config         id_buckets: the identifier bucket count, fixed by the first load
+meta / lpg_format         format: "2", the layout version (see Migrating)
+meta / lpg_id_index_off   present once any writer has run with -id-index=false
 ```
 
 All maps are key-ordered. An edge is stored as `[created, last_seen]`, or `[created, last_seen, {name: value}]` when it carries other properties (from `load -props_columns`). `created` comes first on purpose: a map value range over these lists selects edges by creation time on the server.
@@ -89,7 +92,7 @@ There are no secondary indexes unless you ask for the optional type index (`idx_
 
 Most vertices have a handful of edges (about 2.5 on average with the default descriptors), and those stay inline in the vertex record. Some vertices collect very many: a shared address, a household, or in real data a placeholder identifier. A record can't grow without limit: Aerospike rewrites the whole record on every update, and records are capped at 8 MB. Those vertices become **hubs**.
 
-**Promotion.** A vertex takes edges inline until it holds 256 entries (`-max-inline-edges`). Inline writes carry a filter expression on `edge_count`; the write that would pass the limit is filtered out, and the writer promotes the vertex by recording `hub_in_level` or `hub_out_level` = 0. From then on, new edges in that direction go to edge buckets; the edges already inline stay where they are. A vertex known to be a hub can be promoted before it has any edges (`Store.PromoteHub`, which `generate -hubs` does for its hubs), so its first edge goes straight to a bucket.
+**Promotion.** A vertex takes edges inline until it holds 256 entries (`-max-inline-edges`), counting both directions. Inline writes carry a filter expression on `edge_count`; the write that would pass the limit is filtered out, and the writer promotes the vertex by recording `hub_in_level` or `hub_out_level` = 0 for the direction it is writing. From then on the vertex is a hub in both directions: new edges in either direction go to edge buckets (the other direction gets its level on its first new edge), so a vertex full of incoming edges takes no more outgoing ones inline either. The edges already inline stay where they are, and writing one of them again updates it in place. A vertex known to be a hub can be promoted before it has any edges (`Store.PromoteHub`, which `generate -hubs` does for its hubs), so its first edge goes straight to a bucket. A vertex given more than half the limit in one batch is written on its own instead: its edge count is read first, and its edges go inline if they still fit, to buckets if not.
 
 **Levels of hashed buckets.** A hub's edges in one direction live in levels of buckets. Level *k* has 16·2^*k* buckets, and an edge goes to bucket `FNV-1a(neighbor ID) mod 16·2^k`.
 
@@ -100,6 +103,8 @@ level 2   64 buckets  ■■■■■■■■■□□■■■□■■■□�
 ```
 
 Bucket writes carry a filter on the bucket's `edge_count`. When a bucket of the newest level reaches 256 entries, the writer moves the hub up a level with a compare-and-set on its level bin, so racing writers agree, and retries there. **Nothing is ever rehashed or moved**, so a hub keeps taking writes while it grows. 1M edges take 9 levels (8,176 buckets); 10M take 12 (65,520).
+
+**An edge is stored once.** Before writing a hub's edges, the writer reads, in one batch, the hub record and the one bucket per level each edge hashes to, keeping only the keys it asks about (computed on the server). An edge already stored, inline or at any level, is merged where it is; only new edges go to the newest level. Writing an edge again after its hub moved up a level therefore updates the old copy instead of adding a second one.
 
 This gives every operation on one edge or one page a cost that depends on the number of levels, not edges:
 
@@ -126,14 +131,21 @@ Buckets are sized at about 100 identifiers each at the target size. The default 
 
 This costs about 0.6 B of index memory per identifier, against 14–19 B for a secondary-index entry. The price is paid on writes; see [Trade-offs](#trade-offs-and-limits).
 
+**The index answers only when it can.** Two cases fall back to a scan of `vertices` with the identifier test filtered on the server, in both `LookupIdentifier` and Gremlin's `g.V().has(type, value)`:
+
+- **A tag held by many vertices.** A tag keeps at most 1,000 vertices (`MaxIdentifierShare`): the write that adds one more trims the tag back to its first 1,000 entries, in the same operation, so the bucket can't grow toward the 8 MB record limit when a value such as `"unknown"` or a common literal is shared by millions of vertices. A lookup that finds the tag full scans instead.
+- **A writer that skipped the index.** `-id-index=false` leaves the `lpg_id_index_off` meta record; while it exists, every lookup scans. Gremlin checks for it once per cache TTL. Rebuild the index by reloading with the index on, then delete the record.
+
+The index covers literals too (N-Triples literals are vertex properties keyed by predicate), which is what makes the fan-out cap necessary.
+
 ## Reads
 
 All reads are key lookups or batch reads (`reader.go`):
 
 - **`GetVertices`** batch-reads vertex records: type, identifiers, inline edges and hub levels.
 - **`HubEdges`** reads a hub's bucketed edges in growing chunks, stopping at a limit. It builds keys per chunk, since each key costs a digest.
-- **`HasEdge` / `HasInEdge`** look one edge up from either side.
-- **`Degree`** counts all edges, reading only each bucket's `edge_count`.
+- **`HasEdge` / `HasInEdge`** look one edge up from either side, returning only whether it exists.
+- **`Degree`** counts all edges, reading only each bucket's `edge_count`. It is exact.
 - **`Traverse`** walks hops as one batch read of the frontier per hop. Hubs over `max-degree` are reported and not expanded.
 - **`LookupIdentifier`** and **`VerticesByType`** find vertices by identifier and by type.
 
@@ -155,14 +167,28 @@ The seven RDF query patterns of the triple model all map onto these, through Gre
 
 1. Mutations of the same vertex are merged, so a batch never writes one key twice.
 2. Each vertex becomes one batch write:
-   - **Ordinary vertex:** its map entries are added with server-side CDT operations, plus a filter that refuses the write if the vertex is full or a hub.
-   - **Known hub:** its edges go straight to edge-bucket writes in the same batch.
+   - **Ordinary vertex:** its map entries are merged in with server-side CDT operations and expressions, plus a filter that refuses the write if the vertex is full or a hub.
+   - **Known hub:** its type and identifiers in the batch; its edges right after, through the [stored-once](#hubs-vertices-with-many-edges) path.
+   - **A vertex given many edges at once:** written on its own (see promotion above).
 3. Each identifier bucket touched gets one write in the same batch.
 4. The few writes that come back filtered out (a vertex just filled up, or a bucket did) are retried individually through promotion or the next level.
 
-Writes are idempotent: map entries are keyed, so re-running a load updates rather than duplicates. Counters (`indiv_links`, `edge_count`) are additive and atomic, so concurrent generators never lose an update.
+**Writing the same data again changes nothing.** Every entry is merged, not overwritten:
 
-Each edge is written twice, once on each vertex. The two writes are not atomic with each other; a failure between them leaves the edge on one side. Making them atomic would take multi-record transactions, which need a strong-consistency namespace.
+| Stored | Merge |
+|---|---|
+| Edge or identifier tuple | The earlier `created` (0 meaning unknown), the later `last_seen`; edge properties are the union, the new value winning per name |
+| Vertex `type` | Kept if already set: the first type written wins |
+| Vertex `created` | The earlier of the two |
+| `edge_count`, `indiv_links` | Exact: each write counts the entries before and after its own operations, in the same atomic record operation, and adds the difference |
+
+So a re-run load, an overlapping load, or a retried batch leaves the same records as one clean run, and counts never drift: `indiv_links` counts distinct INDIVIDUAL edges, so sharing caps hold however often a link is written. Concurrent writers never lose an update, since each count is computed inside the record operation that changes the entries.
+
+**Failed batches are retried.** The batch writer tries a failed batch 3 times, with a short backoff; since writes are idempotent, a retry can't double anything.
+
+**The two sides of an edge are separate writes.** Each edge is written on both vertices, and the writes are not atomic with each other: a load that stops between them leaves the edge on one side. Re-running the load completes it. Making the pair atomic would take multi-record transactions, which need a strong-consistency namespace.
+
+**One rare race can store a hub edge twice.** Two writers adding the *same new* edge to a hub at the same moment, while the hub moves up a level, can both find it absent and write it to different levels. All-edge reads would then return it twice and `Degree` would count it twice. Writing the same edge from two concurrent loaders while a hub grows is the only way to hit this.
 
 **Sharing** (the generator's `SHARE_MAX` caps) works without the triple model's `entities` set. Each vertex counts its INDIVIDUAL links in `indiv_links`, in the same write that adds the edge. At startup each generator scans its slice of partitions for shareable vertices under their cap, filtered on the server and stopped once the pool is full.
 
@@ -172,13 +198,17 @@ Each edge is written twice, once on each vertex. The two writes are not atomic w
 
 Its traversal strategies read only what a query needs:
 
-- **Lookups instead of scans.** `g.V().has(type, value)` becomes an identifier lookup, and `hasLabel` uses the type index when it exists.
+- **Lookups instead of scans.** `g.V().has(type, value)` becomes an identifier lookup (or the [fallback scan](#finding-a-vertex-by-identifier)), and `hasLabel` uses the type index once it is built on every node.
 - **Edge filters on the server.** `inE(P).has('created', gt(t))` returns only matching hub edges, selected inside each bucket; with a lower bound, the newest levels are read first.
 - **Counting without reading edges.** `outE().count()` and similar are counted on the server.
 - **Reading less of each record.** Vertices are read without their edge bins, or as keys alone for counts, when that is all the query needs.
 - **`~supernode`** marks hubs, as in AGS.
 
-See the [main README](../README.md#gremlin-and-gdotv) for running it and for example queries.
+Gremlin sees values as stored. On data generated with `-hash-parts` covering IDs or identifiers, `g.V('INDIVIDUAL:1')` and `has('EMAIL_E', 'EMAIL_E_...')` need the hashed forms; the provider doesn't hash its arguments. `cmd/lpgquery` does, given the data's `-hash-type` and `-hash-parts`.
+
+Vertices read in the last `aerospike.cache.ttl.ms` (10 s by default; 0 turns the cache off) are served from a cache of `aerospike.cache.size` vertices (100,000), so a traversal can see data up to that old.
+
+See the [main README](../README.md#gremlin-and-gdotv) for running it and for example queries, and for securing the server.
 
 ## Measured Results
 
@@ -215,26 +245,26 @@ Every operation on one edge or one page stays flat across four orders of magnitu
 | Query | Time |
 |---|---:|
 | A vertex by ID, an identifier lookup, 10 neighbors of the 10M-edge hub | 1.4–4 ms |
-| The 10 most recent of the 10M hub's edges (`has('created', gt(t)).limit(10)`) | 8 ms |
+| 10 of the 10M hub's edges created after *t* (`has('created', gt(t)).limit(10)`) | 8 ms |
 | Count the 10M hub's edges (`inE(P).count()`) | 0.5 s |
 | Count all 159,958 HOUSEHOLDs (`hasLabel(...).count()`, with the type index) | 87 ms |
 | Count all 12.3M vertices (`g.V().count()`, keys only) | 3.4 s |
 
 ## Trade-offs and Limits
 
-**Write amplification on identifier buckets.** Every new identifier rewrites its whole bucket: about 8 KB at 177 entries, against about 260 B for a triple record. With about 58 identifiers per INDIVIDUAL, this is where the model pays for its small index. On a 4 GiB file-backed test namespace, defrag couldn't keep up with these rewrites. Options:
+**Write amplification on identifier buckets.** Every new identifier rewrites its whole bucket: about 8 KB at 177 entries, against about 260 B for a triple record. With about 58 identifiers per INDIVIDUAL, this is where the model pays for its small index. At the target size it dominates everything else the model writes: ~173B identifiers into 2^31 buckets, each write rewriting a bucket that holds ~40 entries on average over the load (~2 KB), comes to **about 330 TB of device writes per replica, about 650 TB at RF 2**, to build about 62 TB of data. Defrag has to reclaim nearly all of that. On a 4 GiB file-backed test namespace, defrag couldn't keep up. Options:
 
-- More buckets: smaller rewrites, more records.
-- `-id-index=false` during bulk loads that don't need lookup by identifier.
+- More buckets: smaller rewrites, more records (2^33 buckets cuts it about fourfold, for about 0.8 TB more primary index at RF 2).
+- `-id-index=false` during bulk loads that don't need lookup by identifier; lookups then [scan](#finding-a-vertex-by-identifier) until the index is rebuilt.
 - A different home for identifier lookup.
 
 **Exact degree grows with the hub.** It reads every bucket's count: 358 ms at 10M edges. The hub's `indiv_links` gives its INDIVIDUAL links in one read. A split counter, sharded across a few records, would make the exact degree constant too.
 
-**Counts without a predicate can over-count.** They add each bucket's `edge_count`, so an edge written to the same bucket twice counts twice. An edge re-added after its hub moved up a level is stored again in the new level, so all-edge reads can see it twice too (the newest copy last). Counts that name a predicate are exact.
-
-**No multigraph.** An edge is identified by (out vertex, predicate, in vertex), so there is at most one edge per predicate between two vertices. That is exact for RDF-style data, which is a set of triples anyway, but not for event-style edges.
+**No multigraph.** An edge is identified by (out vertex, predicate, in vertex), so there is at most one edge per predicate between two vertices; writing it again merges. That is exact for RDF-style data, which is a set of triples anyway, but not for event-style edges.
 
 **Edge properties are stored twice**, once on each vertex, and the two writes are not atomic.
+
+**Literal datatypes are dropped.** An N-Triples literal becomes a string property: `"5"^^xsd:integer` and `"5"` are the same value. Language tags are kept, as `text@lang`, so `"chat"@en` and `"chat"@fr` stay distinct. `rdf:type` triples become the vertex type, like `IS_TYPE`, instead of edges to a class vertex that every instance would link to.
 
 **Edge filter pushdown covers `created` only**, the one property in a fixed position in the stored list. Other edge properties are filtered in the client.
 
@@ -250,12 +280,14 @@ The design follows the same vertex-centric pattern AGS uses, which is standard p
 
 The deliberate differences:
 
-| | AGS | Vertex model |
+| | AGS (3.x) | Vertex model |
 |---|---|---|
-| Inline edge limit | Set by record size (~6,500 edges at 1 MiB) | 256, to keep busy records small, since every update rewrites the record |
-| Supernode edges | Multi-record edge lists (2.x: secondary-index queries over an EDGES set) | Hash-addressed bucket levels: one-edge lookups and pages cost the same at any size |
-| Edge records | 2.x: separate EDGES records packed ~10 per record; 3.x: unpublished | None for ordinary vertices; each edge lives on both vertices |
-| Property lookup | Optional secondary indexes on vertex properties and labels | Identifier lookup through bucket records (cheaper in RAM, costlier to write); optional type index |
+| Edge records | Separate EDGES records, packed `aerospike.graph.phat.edge.size` (default 10) edges per record; a vertex's adjacency points at them | None; each edge lives inline on both of its vertices, or in a hub's buckets |
+| Inline adjacency limit | Set by record size | 256 entries, to keep busy records small, since every update rewrites the record |
+| Supernode edges | Read through secondary indexes on the EDGES set (`E_IN_IDX`, `E_OUT_IDX`) | Hash-addressed bucket levels, key reads only: one-edge lookups and pages cost the same at any size |
+| Edge identity | System-generated edge IDs: a multigraph, any number of edges between two vertices | (out, predicate, in): at most one edge per predicate between two vertices, merged on rewrite |
+| Writes without transactions | An edge record anchors existence, so a half-written edge can be detected | Idempotent merges; a half-written edge is completed by re-running the load |
+| Property lookup | Optional secondary indexes on vertex properties and labels | Identifier lookup through bucket records (cheaper in RAM, costlier to write), with a scan fallback; optional type index |
 | Query engine | Full Gremlin, read and write, with OLAP | Read-only Gremlin with the strategies above |
 
 From AGS we adopted the supernode designation (`PromoteHub`, `~supernode`), supernode warnings, edge-property filter pushdown, local counting, edge-bin omission and counting without bin data, an optional label index, and a general edge-property map.
@@ -284,6 +316,15 @@ JAVA_HOME=/path/to/jdk-17 gremlin/run.sh
 
 The same namespace can hold both models (they use different sets), but they don't share data: load each model separately.
 
+### Migrating From the First Layout
+
+Namespaces loaded before the `lpg_format` record existed (layout 1) have inexact counts: `edge_count` and `indiv_links` were added to on every write, so rewritten edges were counted again, hub edges re-added after a level change were stored twice, and `indiv_links` could pass sharing caps. Layout 2 can't fix that data in place, so:
+
+- The Go writers refuse to write into a namespace that has `lpg_config` but no `lpg_format` of 2, with an error that says so.
+- The Gremlin provider still reads it, logging a warning that counts and hub edges may be inexact.
+
+To migrate, load again into an empty namespace. To reuse the namespace instead, truncate the `vertices`, `edge_buckets` and `identifier_index` sets and delete the `lpg_config`, `lpg_format` and `lpg_id_index_off` records of the `meta` set; leave the rest of `meta`, which the triple model uses.
+
 The integration tests run against a live cluster:
 
 ```bash
@@ -296,10 +337,12 @@ LPG_TEST_HOST=127.0.0.1:3000 go test ./lpg/
 | File | What it does |
 |---|---|
 | `model.go` | Sets, bins, the `Mutation` and `Edge` types, and `FromTriples` |
-| `store.go` | `Store`, writes (`Apply`), inline limit and hub promotion, bucket levels, identifier buckets, `PromoteHub`, the type index |
-| `reader.go` | `GetVertices`, `HubEdges`, `HasEdge`, `Degree`, `LookupIdentifier`, `Traverse`, `VerticesByType`, `ScanShareable` |
+| `store.go` | `Store`, writes (`Apply`), the layout version, inline limit and hub promotion, bucket levels and locating stored hub edges, identifier buckets, `PromoteHub`, the type index |
+| `ops.go` | The merge operations: tuple merges, exact counters, first-type-wins |
+| `reader.go` | `GetVertices`, `HubEdges`, `HasEdge`, `Degree`, `LookupIdentifier` and its scan fallback, `Traverse`, `VerticesByType`, `ScanShareable` |
 | `model_test.go` | Conversion, merging, bucket arithmetic, and golden hashes shared with the Java provider |
 | `store_test.go` | Integration tests against a live cluster: round trips, concurrent hub growth, edge lookups, promotion, sharing scans |
+| `consistency_test.go` | Integration tests that rewriting changes nothing: counts after refreshes, hub edges stored once, identifier fan-out and the index-off fallback, many edges on a new vertex |
 | `../cmd/lpgquery` | Command-line reads |
 | `../cmd/lpgbench` | Hub latency benchmark |
 | `../gremlin` | Read-only TinkerPop provider and Gremlin Server config |

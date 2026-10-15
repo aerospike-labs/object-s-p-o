@@ -4,12 +4,19 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// writeAttempts is how many times a batch is written before it counts as
+// failed. Every write function used with a Writer can be repeated with the
+// same result, so a batch that failed partway, on a timeout for example, is
+// written again whole.
+const writeAttempts = 3
 
 // Writer writes items (triples, or vertex mutations) concurrently: producers
 // Add items in any amount and worker goroutines regroup them into batches of
-// batchSize for write. A failed batch is logged and counted, and writing
-// continues.
+// batchSize for write. A batch that keeps failing is logged and counted, and
+// writing continues.
 type Writer[T any] struct {
 	ch      chan []T
 	wg      sync.WaitGroup
@@ -25,12 +32,18 @@ func NewWriter[T any](write func([]T) error, workers, batchSize int) *Writer[T] 
 	}
 	w := &Writer[T]{ch: make(chan []T, workers*4)}
 	writeBatch := func(batch []T) {
-		if err := write(batch); err != nil {
-			w.errors.Add(1)
-			log.Printf("batch write error: %v", err)
-			return
+		var err error
+		for attempt := 1; attempt <= writeAttempts; attempt++ {
+			if err = write(batch); err == nil {
+				w.written.Add(int64(len(batch)))
+				return
+			}
+			if attempt < writeAttempts {
+				time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+			}
 		}
-		w.written.Add(int64(len(batch)))
+		w.errors.Add(1)
+		log.Printf("batch write error after %d attempts: %v", writeAttempts, err)
 	}
 	for i := 0; i < workers; i++ {
 		w.wg.Add(1)

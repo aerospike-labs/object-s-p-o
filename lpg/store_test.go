@@ -227,13 +227,19 @@ func TestHub(t *testing.T) {
 func TestScanShareable(t *testing.T) {
 	s, p := testStore(t)
 	typ := "T" + strings.ToUpper(strconv.FormatInt(time.Now().UnixNano(), 36)) // unique to this run
-	var muts []*Mutation
+	var triples []*model.Triple
 	for i, links := range []int{1, 2, 3} {
-		muts = append(muts, &Mutation{ID: fmt.Sprintf("%s%s:%d", p, typ, i), Type: typ, Created: 1, Links: links})
+		id := fmt.Sprintf("%s%s:%d", p, typ, i)
+		triples = append(triples, &model.Triple{Subject: id, Predicate: "IS_TYPE", Object: typ, Props: map[string]interface{}{"created": int64(1)}})
+		for j := 0; j < links; j++ {
+			triples = append(triples, &model.Triple{Subject: fmt.Sprintf("%sINDIVIDUAL:%d", p, j), Predicate: "LIVES_AT", Object: id})
+		}
 	}
-	muts = append(muts, &Mutation{ID: p + typ + ":unlinked", Type: typ, Created: 1})
-	if err := s.Apply(muts); err != nil {
-		t.Fatal(err)
+	triples = append(triples, &model.Triple{Subject: p + typ + ":unlinked", Predicate: "IS_TYPE", Object: typ})
+	for i := 0; i < 2; i++ { // writing the same links again doesn't count them again
+		if err := s.Apply(FromTriples(triples, testVocab)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	var got []string
