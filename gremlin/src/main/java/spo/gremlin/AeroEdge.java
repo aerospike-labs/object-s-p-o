@@ -20,7 +20,7 @@ import java.util.Set;
 
 /**
  * An edge, read from either of its vertices, with created, last_seen and any other properties it
- * was loaded with. Its id is {@code <out id>|<label>|<in id>}.
+ * was loaded with. Its id is {@code <out id>|<label>|<in id>}, see {@link AeroGraph#edgeId}.
  */
 final class AeroEdge implements Edge {
 
@@ -50,7 +50,7 @@ final class AeroEdge implements Edge {
 
     @Override
     public Object id() {
-        return outId + "|" + label + "|" + inId;
+        return AeroGraph.edgeId(outId, label, inId);
     }
 
     @Override

@@ -61,7 +61,7 @@ final class AeroGraphStep<S, E extends Element> extends GraphStep<S, E> implemen
             String key = hc.getKey();
             if (!key.startsWith("~") && !NON_IDENTIFIERS.contains(key)) {
                 // An identifier: one bucket read, then the candidates
-                return filter(graph.lookupIdentifier(key, (String) hc.getValue(), withEdges).iterator());
+                return filter(graph.lookupIdentifier(key, (String) hc.getValue(), withEdges));
             }
             if (key.equals(T.label.getAccessor())) {
                 label = (String) hc.getValue();
@@ -78,12 +78,20 @@ final class AeroGraphStep<S, E extends Element> extends GraphStep<S, E> implemen
         withEdges = false;
     }
 
-    /** Whether the folded filters are all label equalities, which a scan applies by itself. */
+    /**
+     * Whether the folded filters are all equalities to one label, which a scan applies by itself.
+     * A scan filters on one label only, so hasLabel('A').hasLabel('B') needs its filters applied.
+     */
     boolean onlyLabelFilters() {
+        Object label = null;
         for (HasContainer hc : hasContainers) {
             if (!hc.getKey().equals(T.label.getAccessor()) || hc.getBiPredicate() != Compare.eq || !(hc.getValue() instanceof String)) {
                 return false;
             }
+            if (label != null && !label.equals(hc.getValue())) {
+                return false;
+            }
+            label = hc.getValue();
         }
         return true;
     }

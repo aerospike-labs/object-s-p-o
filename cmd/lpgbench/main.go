@@ -137,7 +137,7 @@ func (b *bench) leafID(i int64) string { return b.prefix + strconv.FormatInt(i, 
 // edges, as the generator writes them.
 func (b *bench) leafMutations(from, to int64) []*lpg.Mutation {
 	now := time.Now().UnixMilli()
-	hub := &lpg.Mutation{ID: b.hub, In: map[string]map[string]lpg.Edge{pred: {}}, Links: int(to - from)}
+	hub := &lpg.Mutation{ID: b.hub, In: map[string]map[string]lpg.Edge{pred: {}}, LinkPreds: map[string]bool{pred: true}}
 	muts := make([]*lpg.Mutation, 0, to-from+1)
 	for i := from; i < to; i++ {
 		id := b.leafID(i)

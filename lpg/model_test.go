@@ -1,6 +1,7 @@
 package lpg
 
 import (
+	"strings"
 	"testing"
 
 	"graph-sub-pred-obj/model"
@@ -44,8 +45,8 @@ func TestFromTriples(t *testing.T) {
 	if _, ok := addr.In["HAS_AN"]["HOUSEHOLD:3"]; !ok {
 		t.Error("ADDRESS:2 is missing its incoming HAS_AN edge")
 	}
-	if addr.Links != 1 {
-		t.Errorf("ADDRESS:2 links = %d, want 1 (LIVES_AT counts, HAS_AN doesn't)", addr.Links)
+	if !addr.LinkPreds["LIVES_AT"] || addr.LinkPreds["HAS_AN"] || addr.linkPreds()[0] != "LIVES_AT" {
+		t.Errorf("ADDRESS:2 link predicates = %v, want LIVES_AT (LIVES_AT counts, HAS_AN doesn't)", addr.LinkPreds)
 	}
 	if addr.Type != "" {
 		t.Errorf("ADDRESS:2 type = %q; a vertex only linked to must not get a type", addr.Type)
@@ -56,12 +57,55 @@ func TestFromTriples(t *testing.T) {
 }
 
 func TestMerge(t *testing.T) {
-	a := &Mutation{ID: "ADDRESS:2", In: map[string]map[string]Edge{"LIVES_AT": {"INDIVIDUAL:1": {Created: 1, LastSeen: 1}}}, Links: 1}
+	links := map[string]bool{"LIVES_AT": true}
+	a := &Mutation{ID: "ADDRESS:2", In: map[string]map[string]Edge{"LIVES_AT": {"INDIVIDUAL:1": {Created: 3, LastSeen: 3}}}, LinkPreds: links}
 	b := &Mutation{ID: "ADDRESS:2", Type: "ADDRESS", Created: 5,
-		In: map[string]map[string]Edge{"LIVES_AT": {"INDIVIDUAL:7": {Created: 2, LastSeen: 2}}}, Links: 1}
+		In: map[string]map[string]Edge{"LIVES_AT": {
+			"INDIVIDUAL:7": {Created: 2, LastSeen: 2},
+			"INDIVIDUAL:1": {Created: 1, LastSeen: 2, Props: map[string]interface{}{"src": "x"}},
+		}}, LinkPreds: links}
+	c := &Mutation{ID: "ADDRESS:2", Type: "OTHER", Created: 4}
 	a.merge(b)
-	if a.Type != "ADDRESS" || a.Created != 5 || a.Links != 2 || len(a.In["LIVES_AT"]) != 2 {
-		t.Errorf("merged = %+v", a)
+	a.merge(c)
+	if a.Type != "ADDRESS" || a.Created != 4 || !a.LinkPreds["LIVES_AT"] || len(a.In["LIVES_AT"]) != 2 {
+		t.Errorf("merged = %+v; want the first type, the earliest created, both edges", a)
+	}
+	if e := a.In["LIVES_AT"]["INDIVIDUAL:1"]; e.Created != 1 || e.LastSeen != 3 || e.Props["src"] != "x" {
+		t.Errorf("edge written twice = %+v; want the earlier created, the later last_seen, and the props", e)
+	}
+}
+
+func TestFromTriplesRDF(t *testing.T) {
+	vocab := testVocab
+	vocab.RDFType = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+	muts := FromTriples([]*model.Triple{
+		{Subject: "http://x/alice", Predicate: vocab.RDFType, Object: "http://x/Person"},
+		{Subject: "http://x/alice", Predicate: vocab.RDFType, Object: "http://x/Agent"},
+		{Subject: "http://x/alice", Predicate: "http://x/nick", Object: "chat", Props: map[string]interface{}{"datatype": "x", "lang": "en"}},
+		{Subject: "http://x/alice", Predicate: "http://x/nick", Object: "chat", Props: map[string]interface{}{"datatype": "x", "lang": "fr"}},
+	}, vocab)
+	if len(muts) != 1 {
+		t.Fatalf("got %d mutations, want only alice: rdf:type is a type, not an edge to a class vertex", len(muts))
+	}
+	if muts[0].Type != "http://x/Person" {
+		t.Errorf("type = %q, want the first rdf:type", muts[0].Type)
+	}
+	if nicks := muts[0].Identifiers["http://x/nick"]; len(nicks) != 2 {
+		t.Errorf("nicks = %v, want chat@en and chat@fr kept apart", nicks)
+	}
+}
+
+func TestIndexReadable(t *testing.T) {
+	list := "ns=test:indexname=idx_other:set=x:bin=type:type=string:indextype=default:context=NULL:state=RW;" +
+		"ns=test:indexname=idx_vertices_type:set=vertices:bin=type:type=string:indextype=default:context=NULL:state=WO;"
+	if IndexReadable(list, LabelIndexName) {
+		t.Error("an index still being built (state WO) counts as readable")
+	}
+	if !IndexReadable(strings.Replace(list, "state=WO", "state=RW", 1), LabelIndexName) {
+		t.Error("a built index (state RW) doesn't count as readable")
+	}
+	if IndexReadable("", LabelIndexName) {
+		t.Error("a missing index counts as readable")
 	}
 }
 

@@ -32,6 +32,10 @@ const shownRejects = 10
 
 var errTooManyRejects = errors.New("too many rejected records")
 
+// rdfType is the rdf:type predicate as N-Triples are loaded, without angle
+// brackets: with -model lpg its objects become vertex types.
+const rdfType = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+
 func main() {
 	var conn store.ConnConfig
 	conn.RegisterFlags(flag.CommandLine)
@@ -187,14 +191,24 @@ func main() {
 			log.Fatalf("failed to create indexes: %v", err)
 		}
 	case "lpg":
-		// Each batch of triples becomes vertex writes: types, identifiers
-		// and literals on their vertices, other triples as edges with all
-		// their props. Edge props are always merged per edge.
+		// Each batch of triples becomes vertex writes: types (IS_TYPE or
+		// rdf:type), identifiers and literals on their vertices, other
+		// triples as edges with all their props. An edge loaded again is
+		// merged: its earlier created, later last_seen, and props added.
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "props-mode" {
+				log.Fatal("-props-mode applies to -model triples; -model lpg always merges an edge's props")
+			}
+		})
 		ls, err := lpg.New(gs, *idBuckets)
 		if err != nil {
 			log.Fatal(err)
 		}
-		vocab := lpg.Vocabulary{IsType: hasher.Predicate("IS_TYPE"), HasIdentifier: hasher.Predicate("HAS_IDENTIFIER")}
+		vocab := lpg.Vocabulary{
+			IsType:        hasher.Predicate("IS_TYPE"),
+			RDFType:       hasher.Predicate(rdfType),
+			HasIdentifier: hasher.Predicate("HAS_IDENTIFIER"),
+		}
 		write = func(triples []*model.Triple) error { return ls.Apply(lpg.FromTriples(triples, vocab)) }
 	default:
 		log.Fatalf("unknown -model %q (want triples or lpg)", *modelName)

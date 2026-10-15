@@ -3,6 +3,9 @@ package spo.gremlin;
 import org.apache.tinkerpop.gremlin.process.traversal.Compare;
 import org.apache.tinkerpop.gremlin.process.traversal.step.util.HasContainer;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.util.List;
 import java.util.function.BiPredicate;
 
@@ -12,6 +15,9 @@ import java.util.function.BiPredicate;
  * exactly these edges on the server.
  */
 final class CreatedRange {
+    private static final BigInteger MIN = BigInteger.valueOf(Long.MIN_VALUE);
+    private static final BigInteger MAX = BigInteger.valueOf(Long.MAX_VALUE);
+
     final long lo; // inclusive
     final long hi; // exclusive
 
@@ -26,35 +32,70 @@ final class CreatedRange {
 
     /**
      * The range satisfying every has('created', eq|gt|gte|lt|lte number) filter among
-     * containers, or null if there is none.
+     * containers, or null if there is none. created is a whole number, so a fractional bound
+     * rounds toward the values it admits, and eq of a fraction admits none.
      */
     static CreatedRange of(List<HasContainer> containers) {
-        long lo = Long.MIN_VALUE;
-        long hi = Long.MAX_VALUE;
+        BigInteger lo = MIN;
+        BigInteger hi = MAX;
         boolean any = false;
         for (HasContainer hc : containers) {
             if (!"created".equals(hc.getKey()) || !(hc.getValue() instanceof Number)) {
                 continue;
             }
-            long v = ((Number) hc.getValue()).longValue();
+            BigDecimal v = decimal((Number) hc.getValue());
+            if (v == null) {
+                continue;
+            }
+            BigInteger floor = v.setScale(0, RoundingMode.FLOOR).toBigInteger();
+            BigInteger ceil = v.setScale(0, RoundingMode.CEILING).toBigInteger();
             BiPredicate<?, ?> p = hc.getBiPredicate();
             if (p == Compare.eq) {
-                lo = Math.max(lo, v);
-                hi = Math.min(hi, v + 1);
+                if (floor.equals(ceil)) {
+                    lo = lo.max(floor);
+                    hi = hi.min(floor.add(BigInteger.ONE));
+                } else {
+                    hi = lo;
+                }
             } else if (p == Compare.gt) {
-                lo = Math.max(lo, v + 1);
+                lo = lo.max(floor.add(BigInteger.ONE));
             } else if (p == Compare.gte) {
-                lo = Math.max(lo, v);
+                lo = lo.max(ceil);
             } else if (p == Compare.lt) {
-                hi = Math.min(hi, v);
+                hi = hi.min(ceil);
             } else if (p == Compare.lte) {
-                hi = Math.min(hi, v + 1);
+                hi = hi.min(floor.add(BigInteger.ONE));
             } else {
                 continue;
             }
             any = true;
         }
-        return any ? new CreatedRange(lo, hi) : null;
+        if (!any) {
+            return null;
+        }
+        if (lo.compareTo(hi) >= 0 || lo.compareTo(MAX) >= 0 || hi.compareTo(MIN) <= 0) {
+            return new CreatedRange(0, 0);
+        }
+        return new CreatedRange(clamp(lo), clamp(hi));
+    }
+
+    /** The exact value of a number, or null for NaN and infinities, which aren't pushed down. */
+    private static BigDecimal decimal(Number n) {
+        if (n instanceof Long || n instanceof Integer || n instanceof Short || n instanceof Byte) {
+            return BigDecimal.valueOf(n.longValue());
+        }
+        if (n instanceof BigInteger) {
+            return new BigDecimal((BigInteger) n);
+        }
+        if (n instanceof BigDecimal) {
+            return (BigDecimal) n;
+        }
+        double d = n.doubleValue();
+        return Double.isNaN(d) || Double.isInfinite(d) ? null : new BigDecimal(d);
+    }
+
+    private static long clamp(BigInteger v) {
+        return v.max(MIN).min(MAX).longValue();
     }
 
     @Override
