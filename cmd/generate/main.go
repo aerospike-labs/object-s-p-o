@@ -14,6 +14,7 @@ import (
 
 	"graph-sub-pred-obj/hashing"
 	"graph-sub-pred-obj/ingest"
+	"graph-sub-pred-obj/lpg"
 	"graph-sub-pred-obj/model"
 	"graph-sub-pred-obj/store"
 	"graph-sub-pred-obj/version"
@@ -113,6 +114,12 @@ func parseCardinalities(cards []Cardinality) (map[string]cardinalityRange, map[s
 	return ranges, caps, nil
 }
 
+// Storage models for -model.
+const (
+	modelTriples = "triples"
+	modelLPG     = "lpg"
+)
+
 func readJSON(path string, v interface{}) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -155,6 +162,14 @@ func main() {
 	clientCount := flag.Int("client-count", 1, "Total number of generators running at the same time")
 	showVersion := flag.Bool("version", false, "Print the build version and exit")
 	rebuild := flag.Bool("rebuild-entities", false, "Rebuild the entities set and ID counter from existing triples, then exit (run once, with no loads running)")
+	modelName := flag.String("model", modelTriples, "Storage model: triples (one record per triple) or lpg (one record per vertex, with its identifiers and edges)")
+	idBuckets := flag.Uint64("id-buckets", 0, fmt.Sprintf("-model lpg: identifier lookup buckets, fixed on the first load into a namespace (default %d, or the namespace's)", lpg.DefaultIDBuckets))
+	maxInlineEdges := flag.Int("max-inline-edges", lpg.DefaultMaxInlineEdges, "-model lpg: edge entries a vertex record holds before further edges go to overflow records")
+	idIndex := flag.Bool("id-index", true, "-model lpg: write the identifier lookup set")
+	labelIndex := flag.Bool("label-index", false, "-model lpg: create a secondary index on vertex types, so all vertices of a type are found without a scan")
+	hubCount := flag.Int("hubs", 0, "Supernodes: number of fixed hub entities that INDIVIDUALs link to without a sharing cap")
+	hubType := flag.String("hub-type", "HOUSEHOLD", "Supernodes: entity type of the hubs")
+	hubRate := flag.Float64("hub-rate", 0.5, "Supernodes: probability each INDIVIDUAL links to one hub (chosen at random)")
 	flag.Parse()
 
 	if *showVersion {
@@ -171,6 +186,13 @@ func main() {
 	navigation, hashDesc := hasher.Navigation, hasher.Desc
 	if *clientCount < 1 || *clientIndex < 0 || *clientIndex >= *clientCount {
 		log.Fatalf("-client-index must be in [0, %d)", *clientCount)
+	}
+	useLPG := *modelName == modelLPG
+	if !useLPG && *modelName != modelTriples {
+		log.Fatalf("unknown -model %q (want %s or %s)", *modelName, modelTriples, modelLPG)
+	}
+	if useLPG && *rebuild {
+		log.Fatal("-rebuild-entities applies to -model triples; the lpg model counts links on its vertices")
 	}
 
 	var ctFile ContentTypesFile
@@ -194,7 +216,24 @@ func main() {
 	}
 	defer gs.Close()
 
-	if err := gs.CreateIndexes(); err != nil {
+	var ls *lpg.Store
+	mainSet := store.SetName
+	if useLPG {
+		// No secondary indexes: traversals and identifier lookups are key reads
+		if ls, err = lpg.New(gs, *idBuckets); err != nil {
+			log.Fatal(err)
+		}
+		ls.SetMaxInlineEdges(*maxInlineEdges)
+		ls.IndexIdentifiers = *idIndex
+		if *labelIndex {
+			if err := ls.CreateLabelIndex(); err != nil {
+				log.Fatalf("failed to create the vertex type index: %v", err)
+			}
+		}
+		mainSet = lpg.VertexSet
+		fmt.Printf("Model: lpg (%d identifier buckets, %d inline edges per record, identifier index %v)\n\n",
+			ls.IDBuckets, ls.MaxInlineEdges, ls.IndexIdentifiers)
+	} else if err := gs.CreateIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
 	}
 	if err := hashing.CheckStored(gs, navigation); err != nil {
@@ -277,9 +316,12 @@ func main() {
 		log.Fatalf("failed to read ID counter: %v", err)
 	}
 	if !counterSet {
-		existing, err := gs.SetRecordCount(store.SetName)
+		existing, err := gs.SetRecordCount(mainSet)
 		if err != nil {
-			log.Fatalf("failed to check for existing triples: %v", err)
+			log.Fatalf("failed to check for existing records: %v", err)
+		}
+		if existing > 0 && useLPG {
+			log.Fatalf("%d records exist in set %s but the ID counter is unset; load into an empty namespace", existing, mainSet)
 		}
 		if existing > 0 {
 			log.Fatalf("%d triples exist but the ID counter is unset; run once with -rebuild-entities first", existing)
@@ -293,12 +335,33 @@ func main() {
 
 	// Seed sharing from this client's slice of the entities set
 	begin, parts := partitionRange(*clientIndex, *clientCount)
-	entityCount, err := gs.SetRecordCount(store.EntitySetName)
+	seedSet := store.EntitySetName
+	if useLPG {
+		seedSet = lpg.VertexSet
+		pool.persist = false // vertex writes count links themselves
+	}
+	entityCount, err := gs.SetRecordCount(seedSet)
 	if err != nil {
 		log.Fatalf("failed to count entities: %v", err)
 	}
 	loaded := 0
-	if entityCount > 0 {
+	if entityCount > 0 && useLPG {
+		fmt.Printf("Client %d of %d: loading shareable vertices from partitions %d-%d...\n",
+			*clientIndex, *clientCount, begin, begin+parts-1)
+		scanStart := time.Now()
+		rng := rand.New(rand.NewSource(rand.Int63()))
+		for entityType, shareMax := range pool.limits {
+			err := ls.ScanShareable(begin, parts, hashTypeName(entityType), shareMax, maxPoolPerType, func(e store.EntityLinks) error {
+				pool.add(entityType, e.ID, e.Links, rng)
+				loaded++
+				return nil
+			})
+			if err != nil {
+				log.Fatalf("failed to load shareable %s vertices: %v", entityType, err)
+			}
+		}
+		fmt.Printf("  scanned in %s\n", time.Since(scanStart).Round(time.Millisecond))
+	} else if entityCount > 0 {
 		fmt.Printf("Client %d of %d: loading shareable entities from partitions %d-%d...\n",
 			*clientIndex, *clientCount, begin, begin+parts-1)
 		scanStart := time.Now()
@@ -334,12 +397,42 @@ func main() {
 	fmt.Printf("  %-20s shared without limit, %d shareable\n", "HOUSEHOLD", len(pool.avail["HOUSEHOLD"]))
 	fmt.Println()
 
+	var hubs *hubSet
+	if *hubCount > 0 {
+		if hubs, err = newHubSet(*hubCount, *hubType, *hubRate, ontFile.Ontology); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Supernodes: %d %s hubs, linked from %.0f%% of INDIVIDUALs (~%.0f new links per hub)\n\n",
+			*hubCount, *hubType, *hubRate*100, float64(*count)**hubRate/float64(*hubCount))
+	}
+
 	fmt.Printf("Generating %d individuals with full entity graphs...\n", *count)
 
-	// Pipeline: generate → batch → write
-	writer := ingest.NewWriter(gs.BatchPutTriples, *workers, *batchSize)
+	// Pipeline: generate → batch → write. In the lpg model each INDIVIDUAL's
+	// triples become vertex mutations before they are batched.
+	var generated atomic.Int64 // triples generated
+	var addGraph func([]*model.Triple)
+	var closeWriter func()
+	var written, writeErrors func() int64
+	if useLPG {
+		vocab := lpg.Vocabulary{
+			IsType:         hashPredicate("IS_TYPE"),
+			HasIdentifier:  hashPredicate("HAS_IDENTIFIER"),
+			LinkPredicates: map[string]bool{},
+		}
+		for p := range individualPredicates(ontFile.Ontology) {
+			vocab.LinkPredicates[hashPredicate(p)] = true
+		}
+		w := ingest.NewWriter(ls.Apply, *workers, *batchSize)
+		addGraph = func(triples []*model.Triple) { w.Add(lpg.FromTriples(triples, vocab)) }
+		closeWriter, written, writeErrors = w.Close, w.Written, w.Errors
+	} else {
+		w := ingest.NewWriter(gs.BatchPutTriples, *workers, *batchSize)
+		addGraph = w.Add
+		closeWriter, written, writeErrors = w.Close, w.Written, w.Errors
+	}
 	var entitiesWritten atomic.Int64
-	var batchErrors atomic.Int64 // entity write errors; writer counts triple batch errors
+	var batchErrors atomic.Int64 // entity write errors; writer counts its own batch errors
 
 	// Persist entity link counts as additive deltas
 	writeEntities := func(batch []store.EntityLinks) error {
@@ -358,6 +451,21 @@ func main() {
 
 	startTime := time.Now()
 	done := make(chan struct{})
+	now := time.Now().UnixMilli()
+	if hubs != nil {
+		// Hubs' own triples are fixed, so every run and host writes the same ones
+		triples := hubs.triples(*hubType, ctFile.ContentTypes[*hubType], now)
+		generated.Add(int64(len(triples)))
+		addGraph(triples)
+		if useLPG {
+			// Known supernodes: their edges go to edge buckets from the first one
+			for _, id := range hubs.ids {
+				if err := ls.PromoteHub(id); err != nil {
+					log.Fatalf("failed to promote hub %s: %v", id, err)
+				}
+			}
+		}
+	}
 
 	// Entity flusher, separate from progress so a slow flush never hides it
 	flusherDone := make(chan struct{})
@@ -382,11 +490,17 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				written, entities := writer.Written(), entitiesWritten.Load()
 				elapsed := time.Since(startTime).Seconds()
+				if useLPG {
+					triples, muts := generated.Load(), written()
+					fmt.Printf("\r  triples modeled: %d (%.0f/sec)  vertex mutations: %d (%.0f/sec)  errors: %d   ",
+						triples, float64(triples)/elapsed, muts, float64(muts)/elapsed, writeErrors())
+					continue
+				}
+				written, entities := written(), entitiesWritten.Load()
 				fmt.Printf("\r  triples: %d (%.0f/sec)  entities: %d (%.0f/sec)  records: %.0f/sec  errors: %d   ",
 					written, float64(written)/elapsed, entities, float64(entities)/elapsed,
-					float64(written+entities)/elapsed, writer.Errors()+batchErrors.Load())
+					float64(written+entities)/elapsed, writeErrors()+batchErrors.Load())
 			case <-done:
 				return
 			}
@@ -396,7 +510,6 @@ func main() {
 	// Generator goroutines
 	var genWg sync.WaitGroup
 	genCh := make(chan int, *workers*2)
-	now := time.Now().UnixMilli()
 
 	for w := 0; w < *workers; w++ {
 		genWg.Add(1)
@@ -405,7 +518,14 @@ func main() {
 			rng := rand.New(rand.NewSource(seed))
 			for range genCh {
 				indID := generateEntityID("INDIVIDUAL")
-				writer.Add(generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, linkRanges, now, rng, pool))
+				triples := generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, linkRanges, now, rng, pool)
+				if hubs != nil {
+					if t := hubs.link(indID, now, rng); t != nil {
+						triples = append(triples, t)
+					}
+				}
+				generated.Add(int64(len(triples)))
+				addGraph(triples)
 			}
 		}(rand.Int63())
 	}
@@ -416,18 +536,47 @@ func main() {
 	}
 	close(genCh)
 	genWg.Wait()
-	writer.Close()
+	closeWriter()
 	close(done)
 	<-flusherDone
 	flushEntities()
 
 	elapsed := time.Since(startTime)
-	written, entities := writer.Written(), entitiesWritten.Load()
-	fmt.Printf("\n\nDone. Generated %d individuals → %d triples + %d entity records in %s (%.0f triples/sec, %.0f records/sec)\n",
-		*count, written, entities, elapsed.Round(time.Millisecond),
-		float64(written)/elapsed.Seconds(), float64(written+entities)/elapsed.Seconds())
-	if errors := writer.Errors() + batchErrors.Load(); errors > 0 {
+	if useLPG {
+		triples, muts := generated.Load(), written()
+		fmt.Printf("\n\nDone. Generated %d individuals → %d triples modeled as %d vertex mutations in %s (%.0f triples/sec)\n",
+			*count, triples, muts, elapsed.Round(time.Millisecond), float64(triples)/elapsed.Seconds())
+		printLPGRecords(gs)
+	} else {
+		written, entities := written(), entitiesWritten.Load()
+		fmt.Printf("\n\nDone. Generated %d individuals → %d triples + %d entity records in %s (%.0f triples/sec, %.0f records/sec)\n",
+			*count, written, entities, elapsed.Round(time.Millisecond),
+			float64(written)/elapsed.Seconds(), float64(written+entities)/elapsed.Seconds())
+	}
+	if errors := writeErrors() + batchErrors.Load(); errors > 0 {
 		fmt.Printf("  batch errors: %d\n", errors)
 		os.Exit(1)
 	}
+}
+
+// printLPGRecords prints the record count of each lpg set and the primary
+// index memory it takes: 64 bytes per record, replicas included, since the
+// counts are summed over all nodes.
+func printLPGRecords(gs *store.GraphStore) {
+	var total int64
+	for _, set := range []struct{ name, desc string }{
+		{lpg.VertexSet, "vertices"},
+		{lpg.EdgeBucketSet, "hub edge buckets"},
+		{lpg.IDIndexSet, "identifier buckets"},
+	} {
+		n, err := gs.SetRecordCount(set.name)
+		if err != nil {
+			log.Printf("failed to count set %s: %v", set.name, err)
+			return
+		}
+		total += n
+		fmt.Printf("  set %-16s %-22s %d records\n", set.name, set.desc, n)
+	}
+	fmt.Printf("  primary index: %d records (all copies) × 64 B = %.2f GiB in the namespace\n",
+		total, float64(total*64)/(1<<30))
 }

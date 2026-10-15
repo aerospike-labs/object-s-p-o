@@ -17,6 +17,7 @@ import (
 
 	"graph-sub-pred-obj/hashing"
 	"graph-sub-pred-obj/ingest"
+	"graph-sub-pred-obj/lpg"
 	"graph-sub-pred-obj/model"
 	"graph-sub-pred-obj/store"
 	"graph-sub-pred-obj/version"
@@ -55,6 +56,8 @@ func main() {
 	hashParts := flag.String("hash-parts", hashing.PartIdentifiers, hashing.FlagHelp)
 	clientIndex := flag.Int("client-index", 0, "This loader's index (0-based) when running on multiple hosts")
 	clientCount := flag.Int("client-count", 1, "Total number of loaders sharing the same -input")
+	modelName := flag.String("model", "triples", "Storage model: triples (one record per triple) or lpg (one record per vertex; see README Vertex Model)")
+	idBuckets := flag.Uint64("id-buckets", 0, fmt.Sprintf("-model lpg: identifier lookup buckets, fixed on the first load into a namespace (default %d, or the namespace's)", lpg.DefaultIDBuckets))
 	rebuildPreds := flag.Bool("rebuild-predicates", false, "Record the predicates of all existing triples in the meta set, then exit (for data written before predicates were recorded)")
 	showVersion := flag.Bool("version", false, "Print the build version and exit")
 	flag.Parse()
@@ -170,13 +173,6 @@ func main() {
 		log.Fatalf("failed to connect: %v", err)
 	}
 	defer gs.Close()
-	if err := gs.CreateIndexes(); err != nil {
-		log.Fatalf("failed to create indexes: %v", err)
-	}
-	if err := hashing.CheckStored(gs, hasher.Navigation); err != nil {
-		log.Fatal(err)
-	}
-
 	write := gs.BatchPutTriples
 	switch *propsMode {
 	case "replace":
@@ -184,6 +180,27 @@ func main() {
 		write = gs.BatchMergeTriples
 	default:
 		log.Fatalf("unknown -props-mode %q (want replace or merge)", *propsMode)
+	}
+	switch *modelName {
+	case "triples":
+		if err := gs.CreateIndexes(); err != nil {
+			log.Fatalf("failed to create indexes: %v", err)
+		}
+	case "lpg":
+		// Each batch of triples becomes vertex writes: types, identifiers
+		// and literals on their vertices, other triples as edges with all
+		// their props. Edge props are always merged per edge.
+		ls, err := lpg.New(gs, *idBuckets)
+		if err != nil {
+			log.Fatal(err)
+		}
+		vocab := lpg.Vocabulary{IsType: hasher.Predicate("IS_TYPE"), HasIdentifier: hasher.Predicate("HAS_IDENTIFIER")}
+		write = func(triples []*model.Triple) error { return ls.Apply(lpg.FromTriples(triples, vocab)) }
+	default:
+		log.Fatalf("unknown -model %q (want triples or lpg)", *modelName)
+	}
+	if err := hashing.CheckStored(gs, hasher.Navigation); err != nil {
+		log.Fatal(err)
 	}
 
 	rejects, err := newRejectLog(*rejectPath, *maxRejects)
@@ -268,7 +285,7 @@ func main() {
 
 // loadSplit parses one split, queueing its triples, hashed, for writing in
 // batches. It stops early once another split has failed.
-func loadSplit(parser ingest.Parser, s ingest.Split, hash func(*model.Triple) *model.Triple, writer *ingest.Writer, batchSize int,
+func loadSplit(parser ingest.Parser, s ingest.Split, hash func(*model.Triple) *model.Triple, writer *ingest.Writer[*model.Triple], batchSize int,
 	rows *atomic.Int64, rejects *rejectLog, failed *atomic.Bool) error {
 	const rowFlush = 4096
 	var n int64

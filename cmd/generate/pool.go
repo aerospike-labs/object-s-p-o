@@ -26,17 +26,21 @@ type sharePool struct {
 	avail  map[string][]string // entity type -> IDs below cap
 	counts map[string]int      // entity ID -> INDIVIDUALs linked
 	dirty  map[string]store.EntityLinks
+	// persist records link deltas for takeDirty. Off when the links are
+	// counted on the vertices themselves (-model lpg).
+	persist bool
 }
 
 // newSharePool shares entities of the types in caps, each by at most its cap
 // of INDIVIDUALs, and HOUSEHOLDs without limit.
 func newSharePool(rate float64, caps map[string]int) *sharePool {
 	p := &sharePool{
-		rate:   rate,
-		limits: map[string]int{"HOUSEHOLD": 0},
-		avail:  make(map[string][]string),
-		counts: make(map[string]int),
-		dirty:  make(map[string]store.EntityLinks),
+		rate:    rate,
+		limits:  map[string]int{"HOUSEHOLD": 0},
+		avail:   make(map[string][]string),
+		counts:  make(map[string]int),
+		dirty:   make(map[string]store.EntityLinks),
+		persist: true,
 	}
 	for t, c := range caps {
 		p.limits[t] = c
@@ -86,6 +90,9 @@ func (p *sharePool) created(entityType, id string, rng *rand.Rand) {
 
 // markLinked records one new INDIVIDUAL link to persist. Caller holds mu.
 func (p *sharePool) markLinked(entityType, id string) {
+	if !p.persist {
+		return
+	}
 	d := p.dirty[id]
 	d.ID, d.Type = id, entityType
 	d.Links++

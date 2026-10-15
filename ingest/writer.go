@@ -4,15 +4,14 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
-
-	"graph-sub-pred-obj/model"
 )
 
-// Writer writes triples concurrently: producers Add triples in any amount and
-// worker goroutines regroup them into batches of batchSize for write. A failed
-// batch is logged and counted, and writing continues.
-type Writer struct {
-	ch      chan []*model.Triple
+// Writer writes items (triples, or vertex mutations) concurrently: producers
+// Add items in any amount and worker goroutines regroup them into batches of
+// batchSize for write. A failed batch is logged and counted, and writing
+// continues.
+type Writer[T any] struct {
+	ch      chan []T
 	wg      sync.WaitGroup
 	written atomic.Int64
 	errors  atomic.Int64
@@ -20,12 +19,12 @@ type Writer struct {
 
 // NewWriter starts workers goroutines writing batches with write, typically
 // GraphStore.BatchPutTriples.
-func NewWriter(write func([]*model.Triple) error, workers, batchSize int) *Writer {
+func NewWriter[T any](write func([]T) error, workers, batchSize int) *Writer[T] {
 	if batchSize <= 0 {
 		batchSize = DefaultBatchSize
 	}
-	w := &Writer{ch: make(chan []*model.Triple, workers*4)}
-	writeBatch := func(batch []*model.Triple) {
+	w := &Writer[T]{ch: make(chan []T, workers*4)}
+	writeBatch := func(batch []T) {
 		if err := write(batch); err != nil {
 			w.errors.Add(1)
 			log.Printf("batch write error: %v", err)
@@ -37,9 +36,9 @@ func NewWriter(write func([]*model.Triple) error, workers, batchSize int) *Write
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
-			buffer := make([]*model.Triple, 0, batchSize)
-			for triples := range w.ch {
-				buffer = append(buffer, triples...)
+			buffer := make([]T, 0, batchSize)
+			for items := range w.ch {
+				buffer = append(buffer, items...)
 				for len(buffer) >= batchSize {
 					writeBatch(buffer[:batchSize])
 					buffer = append(buffer[:0], buffer[batchSize:]...)
@@ -53,20 +52,20 @@ func NewWriter(write func([]*model.Triple) error, workers, batchSize int) *Write
 	return w
 }
 
-// Add queues triples for writing. The caller must not modify the slice
+// Add queues items for writing. The caller must not modify the slice
 // afterwards.
-func (w *Writer) Add(triples []*model.Triple) {
-	w.ch <- triples
+func (w *Writer[T]) Add(items []T) {
+	w.ch <- items
 }
 
-// Close writes the remaining triples and waits for the workers to finish.
-func (w *Writer) Close() {
+// Close writes the remaining items and waits for the workers to finish.
+func (w *Writer[T]) Close() {
 	close(w.ch)
 	w.wg.Wait()
 }
 
-// Written returns the number of triples written so far.
-func (w *Writer) Written() int64 { return w.written.Load() }
+// Written returns the number of items written so far.
+func (w *Writer[T]) Written() int64 { return w.written.Load() }
 
 // Errors returns the number of batches that failed.
-func (w *Writer) Errors() int64 { return w.errors.Load() }
+func (w *Writer[T]) Errors() int64 { return w.errors.Load() }

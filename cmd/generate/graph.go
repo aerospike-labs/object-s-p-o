@@ -12,6 +12,12 @@ import (
 // ---------------------------------------------------------------------------
 
 func generateEntityTriples(entityID string, contentType string, propDefs map[string][]PropertyMeta, now int64) []*model.Triple {
+	return entityTriples(entityID, contentType, propDefs, now, generateIdentifierValue)
+}
+
+// entityTriples returns an entity's IS_TYPE and HAS_IDENTIFIER triples, with
+// identifier values from value.
+func entityTriples(entityID string, contentType string, propDefs map[string][]PropertyMeta, now int64, value func(propName string) string) []*model.Triple {
 	var triples []*model.Triple
 
 	for propName, metas := range propDefs {
@@ -19,7 +25,7 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 			continue
 		}
 		meta := metas[0]
-		value := generateIdentifierValue(propName)
+		value := value(propName)
 
 		triples = append(triples, &model.Triple{
 			Subject:   entityID,
@@ -159,4 +165,62 @@ func generateIndividualGraph(
 	}
 
 	return triples
+}
+
+// ---------------------------------------------------------------------------
+// Supernodes
+// ---------------------------------------------------------------------------
+
+// hubSet is a fixed set of entities that INDIVIDUALs link to without a
+// sharing cap, to grow supernodes on purpose.
+type hubSet struct {
+	ids  []string
+	pred string // predicate from INDIVIDUAL to the hub type, as stored
+	rate float64
+}
+
+// newHubSet returns count hubs of entityType, linked from INDIVIDUALs by the
+// ontology's predicate to that type. Hub IDs and identifiers are fixed, so
+// every run and every host links to the same hubs.
+func newHubSet(count int, entityType string, rate float64, ontology []OntologyRelation) (*hubSet, error) {
+	pred := ""
+	for _, rel := range ontology {
+		if rel.Sub == "INDIVIDUAL" && rel.Obj == entityType {
+			pred = rel.Pred
+			break
+		}
+	}
+	if pred == "" {
+		return nil, fmt.Errorf("-hub-type %s: the ontology has no INDIVIDUAL relation to it", entityType)
+	}
+	h := &hubSet{pred: hashPredicate(pred), rate: rate}
+	for i := 0; i < count; i++ {
+		h.ids = append(h.ids, hashEntityID(fmt.Sprintf("%s:HUB-%d", entityType, i)))
+	}
+	return h, nil
+}
+
+// triples returns the hubs' own IS_TYPE and HAS_IDENTIFIER triples.
+func (h *hubSet) triples(entityType string, propDefs map[string][]PropertyMeta, now int64) []*model.Triple {
+	var triples []*model.Triple
+	for i, id := range h.ids {
+		triples = append(triples, entityTriples(id, entityType, propDefs, now, func(propName string) string {
+			return fmt.Sprintf("%s_HUB_%d", propName, i)
+		})...)
+	}
+	return triples
+}
+
+// link returns, with probability rate, a triple linking an INDIVIDUAL to a
+// random hub.
+func (h *hubSet) link(individualID string, now int64, rng *rand.Rand) *model.Triple {
+	if len(h.ids) == 0 || rng.Float64() >= h.rate {
+		return nil
+	}
+	return &model.Triple{
+		Subject:   individualID,
+		Predicate: h.pred,
+		Object:    h.ids[rng.Intn(len(h.ids))],
+		Props:     map[string]interface{}{"created": now, "last_seen": now},
+	}
 }
